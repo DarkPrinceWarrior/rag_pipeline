@@ -43,6 +43,9 @@ import numpy as np
 from dotenv import load_dotenv
 from tqdm import tqdm
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from sentence_transformers import SentenceTransformer, CrossEncoder # <-- Добавляем CrossEncoder
+from sklearn.feature_extraction.text import TfidfVectorizer # <-- Добавляем
+from sklearn.metrics.pairwise import cosine_similarity # <-- Добавляем
 
 # ---------------------------
 # Configuration (change if needed)
@@ -51,13 +54,33 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parents[1]
 PDF_DIR = str(BASE_DIR / "pdfs")
 VECTOR_STORE_PATH = str(BASE_DIR / "faiss_index")  # directory where index and metadata are stored
-EMBEDDING_MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B" # all-mpnet-base-v2 # jinaai/jina-embeddings-v4
+EMBEDDING_MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
+RERANKER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2" # <-- Новая модель
 CHUNK_SIZE = 1000  # approx characters per chunk
 CHUNK_OVERLAP = 200
-TOP_K = 7  # number of top chunks to retrieve
+TOP_K_RETRIEVAL = 15  # <-- Увеличиваем, чтобы реранкеру было из чего выбирать
+TOP_K_FINAL = 5       # <-- Финальное количество
 OPENROUTER_API_KEY = None  # loaded from .env; left None here by design
 OPENROUTER_MODEL = "openai/gpt-oss-120b"
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+
+# Глобальные переменные для хранения индексов и моделей
+embedder = None
+reranker = None
+tfidf_vectorizer = None
+tfidf_matrix = None
+faiss_index = None
+chunks_metadata = []
+
+def initialize_models():
+    """Инициализирует и кэширует модели в глобальных переменных."""
+    global embedder, reranker
+    if embedder is None:
+        print(f"[INFO] Загрузка embedding модели '{EMBEDDING_MODEL_NAME}'...")
+        embedder = SentenceTransformer(EMBEDDING_MODEL_NAME, trust_remote_code=True)
+    if reranker is None:
+        print(f"[INFO] Загрузка reranker модели '{RERANKER_MODEL_NAME}'...")
+        reranker = CrossEncoder(RERANKER_MODEL_NAME)
 
 # ---------------------------
 # Utilities
@@ -126,6 +149,123 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
     # Отфильтровываем слишком короткие/пустые чанки
     chunks = [c.strip() for c in chunks if len(c.strip()) > 20]
     return chunks
+
+def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: bool = False):
+    """
+    Создает или загружает полную базу знаний, включая dense и sparse индексы.
+    Возвращает True, если база готова к использованию.
+    """
+    global faiss_index, chunks_metadata, tfidf_vectorizer, tfidf_matrix
+
+    initialize_models() # Убедимся, что модели загружены
+
+    # --- Пути к файлам ---
+    ensure_dir(index_dir)
+    faiss_path = os.path.join(index_dir, "index.faiss")
+    metadata_path = os.path.join(index_dir, "metadata.pkl")
+    tfidf_vec_path = os.path.join(index_dir, "tfidf_vectorizer.pkl")
+    tfidf_matrix_path = os.path.join(index_dir, "tfidf_matrix.pkl")
+
+    if force_rebuild:
+        for path in [faiss_path, metadata_path, tfidf_vec_path, tfidf_matrix_path]:
+            if os.path.exists(path):
+                os.remove(path)
+
+    # --- Загрузка из кэша ---
+    if all(os.path.exists(p) for p in [faiss_path, metadata_path, tfidf_vec_path, tfidf_matrix_path]):
+        print("[INFO] Загрузка существующей базы знаний...")
+        faiss_index = faiss.read_index(faiss_path)
+        with open(metadata_path, "rb") as f:
+            chunks_metadata = pickle.load(f)
+        with open(tfidf_vec_path, "rb") as f:
+            tfidf_vectorizer = pickle.load(f)
+        with open(tfidf_matrix_path, "rb") as f:
+            tfidf_matrix = pickle.load(f)
+        print("[INFO] База знаний успешно загружена.")
+        return True
+
+    # --- Создание новой базы ---
+    print("[INFO] Создание новой базы знаний...")
+    docs = load_pdfs_from_directory(pdf_dir)
+    if not docs:
+        raise RuntimeError(f"PDF-файлы не найдены в {pdf_dir}.")
+
+    # 1. Чанкинг
+    all_chunks_text = []
+    chunks_metadata = []
+    for doc_id, (filename, text) in enumerate(docs.items()):
+        raw_chunks = chunk_text(text)
+        for i, c_text in enumerate(raw_chunks):
+            chunks_metadata.append({"source": filename, "chunk_index": i, "text": c_text})
+            all_chunks_text.append(c_text)
+
+    print(f"[INFO] Создано {len(all_chunks_text)} чанков.")
+
+    # 2. Создание Dense индекса (FAISS)
+    print("[INFO] Создание Dense (векторного) индекса...")
+    embeddings = embedder.encode(
+        all_chunks_text, show_progress_bar=True, convert_to_numpy=True, normalize_embeddings=True
+    ).astype("float32")
+    dim = embeddings.shape[1]
+    faiss_index = faiss.IndexFlatIP(dim)
+    faiss_index.add(embeddings)
+    faiss.write_index(faiss_index, faiss_path)
+
+    # 3. Создание Sparse индекса (TF-IDF)
+    print("[INFO] Создание Sparse (TF-IDF) индекса...")
+    tfidf_vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=2)
+    tfidf_matrix = tfidf_vectorizer.fit_transform(all_chunks_text)
+    with open(tfidf_vec_path, "wb") as f: pickle.dump(tfidf_vectorizer, f)
+    with open(tfidf_matrix_path, "wb") as f: pickle.dump(tfidf_matrix, f)
+
+    # Сохраняем метаданные
+    with open(metadata_path, "wb") as f: pickle.dump(chunks_metadata, f)
+
+    print("[INFO] База знаний успешно создана и сохранена.")
+    return True
+
+def hybrid_search(question: str) -> List[Dict[str, Any]]:
+    """
+    Выполняет гибридный поиск с последующим переранжированием.
+    """
+    global faiss_index, chunks_metadata, tfidf_vectorizer, tfidf_matrix, embedder, reranker
+
+    # 1. Dense Search
+    q_emb = embedder.encode([question], normalize_embeddings=True).astype("float32")
+    scores, indices = faiss_index.search(q_emb, TOP_K_RETRIEVAL)
+    dense_results = {idx: score for idx, score in zip(indices[0], scores[0]) if idx != -1}
+
+    # 2. Sparse Search
+    q_tfidf = tfidf_vectorizer.transform([question])
+    sparse_scores = cosine_similarity(q_tfidf, tfidf_matrix).flatten()
+    top_sparse_indices = np.argsort(sparse_scores)[-TOP_K_RETRIEVAL:][::-1]
+    sparse_results = {idx: sparse_scores[idx] for idx in top_sparse_indices if sparse_scores[idx] > 0}
+
+    # 3. Объединение и сборка кандидатов
+    all_indices = set(dense_results.keys()) | set(sparse_results.keys())
+    
+    candidates = []
+    for idx in all_indices:
+        candidate = chunks_metadata[idx].copy()
+        candidate['dense_score'] = dense_results.get(idx, 0.0)
+        candidate['sparse_score'] = sparse_results.get(idx, 0.0)
+        candidates.append(candidate)
+
+    # 4. Переранжирование (Reranking)
+    pairs = [(question, cand['text']) for cand in candidates]
+    if not pairs:
+        return []
+
+    rerank_scores = reranker.predict(pairs, show_progress_bar=False)
+
+    for cand, score in zip(candidates, rerank_scores):
+        cand['rerank_score'] = float(score)
+        # Комбинированный финальный скор: реранкер имеет наибольший вес
+        cand['final_score'] = 0.8 * cand['rerank_score'] + 0.15 * cand['dense_score'] + 0.05 * cand['sparse_score']
+
+    # 5. Сортировка и возврат лучших
+    candidates.sort(key=lambda x: x['final_score'], reverse=True)
+    return candidates[:TOP_K_FINAL]
 
 
 # ---------------------------
@@ -367,30 +507,23 @@ def call_openrouter_chat_completion(api_key: str,
 # RAG chain creation wrapper
 # ---------------------------
 
-def create_rag_chain(index: faiss.Index,
-                     metadata: List[Dict[str, Any]],
-                     embedder: LocalEmbedder,
-                     openrouter_api_key: str,
-                     openrouter_model: str = OPENROUTER_MODEL):
+# --- ГЛАВНАЯ ОБНОВЛЕННАЯ ФУНКЦИЯ ---
+def create_rag_chain(openrouter_api_key: str, openrouter_model: str = OPENROUTER_MODEL):
+    """
+    Создает RAG-цепочку, интегрируя перевод, гибридный поиск и переранжирование.
+    """
 
     def translate_query_to_english(question: str) -> str:
-        """Использует LLM для перевода вопроса на английский язык."""
-        # Если вопрос уже похож на английский, не переводим
+        """Ваша функция перевода (без изменений)."""
         try:
-            # Простая эвристика: если мало кириллических символов, считаем, что это английский
             if sum(1 for char in question if 'а' <= char.lower() <= 'я') < len(question) / 4:
                 print("[INFO] Запрос уже на английском, перевод не требуется.")
                 return question
-        except Exception:
-            pass # Игнорируем ошибки для не-строковых вводов
+        except Exception: pass
 
         print(f"[INFO] Переводим запрос на английский: '{question}'")
         prompt = f"Translate the following user question into English. Return ONLY the translated text, without any explanation or quotation marks.\n\nUser question: \"{question}\"\n\nEnglish translation:"
-
-        messages = [
-            {"role": "system", "content": "You are a helpful translation assistant."},
-            {"role": "user", "content": prompt}
-        ]
+        messages = [{"role": "system", "content": "You are a helpful translation assistant."}, {"role": "user", "content": prompt}]
         
         try:
             response_json = call_openrouter_chat_completion(
@@ -404,21 +537,23 @@ def create_rag_chain(index: faiss.Index,
             print(f"[WARN] Не удалось перевести запрос, используется оригинал: {e}")
             return question
     
-    def answer_question(question: str, top_k: int = TOP_K) -> tuple[str, str]:
+    def answer_question(question: str) -> tuple[str, str]:
         # --- ШАГ 1: ПЕРЕВОД ЗАПРОСА ---
         english_question = translate_query_to_english(question)
 
-        # --- ШАГ 2: ПОИСК ПО ПЕРЕВЕДЕННОМУ ЗАПРОСУ ---
-        retrieved = retrieve_relevant_chunks(english_question, index, metadata, embedder, top_k=top_k)
+        # --- ШАГ 2: ГИБРИДНЫЙ ПОИСК И ПЕРЕРАНЖИРОВАНИЕ ---
+        # Мы вызываем новую мощную функцию вместо старого retrieve_relevant_chunks
+        retrieved = hybrid_search_with_rerank(english_question, TOP_K_RETRIEVAL, TOP_K_FINAL)
         
         if not retrieved:
             return "На основе предоставленных документов я не могу найти ответ на этот вопрос.", "Контекст не был найден в базе знаний."
 
-        # --- ШАГ 3: СБОРКА КОНТЕКСТА И ГЕНЕРАЦИЯ ОТВЕТА (без изменений) ---
-        retrieved_sorted = sorted(retrieved, key=lambda x: x["score"], reverse=True)
+        # --- ШАГ 3: СБОРКА КОНТЕКСТА (с новой информацией) ---
         context_pieces = []
-        for r in retrieved_sorted:
-            piece = f"---\nSource: {r.get('source','unknown')}\nChunk index: {r.get('chunk_index')}\nSimilarity: {r.get('score'):.4f}\nText:\n{r.get('text')}\n"
+        for r in retrieved:
+            piece = (f"---\nИсточник: {r.get('source','unknown')} [чанк {r.get('chunk_index')}]\n"
+                     f"Оценка релевантности (Reranker): {r.get('final_score'):.4f}\n"
+                     f"Текст:\n{r.get('text')}\n")
             context_pieces.append(piece)
         context = "\n\n".join(context_pieces)
 
@@ -496,12 +631,7 @@ def create_rag_chain(index: faiss.Index,
         except Exception as e:
             raise RuntimeError(f"Failed to parse OpenRouter response: {e}. Full response: {json.dumps(response_json)}")
 
-    return {
-        "answer_question": answer_question,
-        "index": index,
-        "metadata": metadata,
-        "embedder": embedder
-    }
+    return { "answer_question": answer_question }
 
 
 # ---------------------------

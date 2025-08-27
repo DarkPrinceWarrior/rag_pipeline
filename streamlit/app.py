@@ -6,6 +6,9 @@ import shutil
 # Важно: Нам нужно получить не только ответ, но и контекст для отладки
 from rag_core import get_or_create_vector_store, create_rag_chain
 
+# Импортируем обновленные функции
+from rag_core import build_and_load_knowledge_base, create_rag_chain, _load_api_key_from_env
+
 # --- Конфигурация страницы ---
 st.set_page_config(
     page_title="RAG-чат с вашими PDF",
@@ -60,8 +63,14 @@ PDF_DIR = BASE_DIR / "pdfs"
 VECTOR_STORE_PATH = BASE_DIR / "faiss_index"
 PDF_DIR.mkdir(parents=True, exist_ok=True)
 
+# --- Инициализация состояния сессии ---
+if "rag_chain" not in st.session_state:
+    st.session_state.rag_chain = None
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# --- Обработка кнопки "Обработать документы" ---
 if process_button:
-    # ... (логика обработки кнопки остается без изменений) ...
     if not uploaded_files:
         st.error("Пожалуйста, загрузите хотя бы один PDF-файл.")
     elif 'openrouter_api_key' not in st.session_state or not st.session_state.openrouter_api_key:
@@ -77,73 +86,67 @@ if process_button:
         
         with st.spinner("Идёт обработка документов... Это может занять некоторое время."):
             try:
-                index, metadata, embedder = get_or_create_vector_store(
-                    pdf_dir=str(PDF_DIR),
-                    index_dir=str(VECTOR_STORE_PATH),
+                # Используем новую функцию для построения/загрузки базы знаний
+                build_and_load_knowledge_base(
+                    pdf_dir=PDF_DIR,
+                    index_dir=VECTOR_STORE_PATH,
                     force_rebuild=True
                 )
+                # Создаем цепочку
                 st.session_state.rag_chain = create_rag_chain(
-                    index=index,
-                    metadata=metadata,
-                    embedder=embedder,
                     openrouter_api_key=st.session_state.openrouter_api_key
                 )
-                # Инициализируем историю чата после успешной обработки
                 st.session_state.messages = []
-                st.success("Документы успешно обработаны! Теперь вы можете задавать вопросы.")
+                st.success("База знаний успешно создана! Теперь вы можете задавать вопросы.")
             except Exception as e:
                 st.error(f"Произошла ошибка при обработке документов: {e}")
                 if VECTOR_STORE_PATH.exists():
                     shutil.rmtree(VECTOR_STORE_PATH)
 
-# --- Отображение чата ---
+# --- Загрузка базы знаний при первом запуске, если она уже есть ---
+if st.session_state.rag_chain is None and 'openrouter_api_key' in st.session_state:
+    try:
+        # Пытаемся загрузить без перестройки
+        if build_and_load_knowledge_base(pdf_dir=PDF_DIR, index_dir=VECTOR_STORE_PATH, force_rebuild=False):
+            st.session_state.rag_chain = create_rag_chain(st.session_state.openrouter_api_key)
+            st.info("Существующая база знаний загружена. Готов к работе!")
+    except Exception as e:
+        st.warning(f"Не удалось загрузить существующую базу знаний: {e}. Пожалуйста, загрузите файлы и обработайте их.")
+
+# --- Отображение чата и обработка запросов ---
 st.header("Диалог")
 
-# Инициализация истории чата, если она еще не создана
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-# Отображение предыдущих сообщений
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
-        # Отображаем отладочную информацию, если она есть
         if "context" in message and message["context"]:
              with st.expander("Показать контекст, переданный в LLM"):
                 st.text(message["context"])
 
-
-# Поле для ввода нового вопроса
 if prompt := st.chat_input("Ваш вопрос..."):
-    if 'rag_chain' not in st.session_state:
-        st.warning("Пожалуйста, сначала обработайте документы, используя форму в боковой панели.")
+    if st.session_state.rag_chain is None:
+        st.warning("Пожалуйста, сначала обработайте документы или убедитесь, что API ключ введен.")
     else:
-        # 1. Отобразить и сохранить вопрос пользователя
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # 2. Получить и отобразить ответ модели
         with st.chat_message("assistant"):
-            with st.spinner("Думаю над ответом..."):
+            with st.spinner("Идет гибридный поиск и генерация ответа..."):
                 try:
                     rag_chain = st.session_state.rag_chain
-                    # Получаем ответ и контекст
                     answer, context = rag_chain["answer_question"](prompt)
                     
                     response_placeholder = st.empty()
                     response_placeholder.markdown(answer)
-
-                    # Показываем отладочную информацию
-                    with st.expander("Показать контекст, переданный в LLM"):
-                        st.text(context)
                     
-                    # Сохраняем ответ и контекст в историю
+                    with st.expander("Показать расширенный контекст, переданный в LLM"):
+                        st.text(context) # Теперь контекст содержит оценки релевантности!
+                    
                     st.session_state.messages.append({
                         "role": "assistant",
                         "content": answer,
-                        "context": context # Сохраняем для отладки
+                        "context": context
                     })
-
                 except Exception as e:
                     st.error(f"Произошла ошибка при получении ответа: {e}")

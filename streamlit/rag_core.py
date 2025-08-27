@@ -38,14 +38,13 @@ import json
 import requests
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
-from sentence_transformers import SentenceTransformer
 import numpy as np
 from dotenv import load_dotenv
 from tqdm import tqdm
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from sentence_transformers import SentenceTransformer, CrossEncoder # <-- Добавляем CrossEncoder
-from sklearn.feature_extraction.text import TfidfVectorizer # <-- Добавляем
-from sklearn.metrics.pairwise import cosine_similarity # <-- Добавляем
+from sentence_transformers import SentenceTransformer, CrossEncoder
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # ---------------------------
 # Configuration (change if needed)
@@ -56,21 +55,21 @@ PDF_DIR = str(BASE_DIR / "pdfs")
 VECTOR_STORE_PATH = str(BASE_DIR / "faiss_index")  # directory where index and metadata are stored
 EMBEDDING_MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
 RERANKER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2" # <-- Новая модель
-CHUNK_SIZE = 1000  # approx characters per chunk
+CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
-TOP_K_RETRIEVAL = 15  # <-- Увеличиваем, чтобы реранкеру было из чего выбирать
-TOP_K_FINAL = 5       # <-- Финальное количество
-OPENROUTER_API_KEY = None  # loaded from .env; left None here by design
+TOP_K_RETRIEVAL = 15
+TOP_K_FINAL = 5
 OPENROUTER_MODEL = "openai/gpt-oss-120b"
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 
-# Глобальные переменные для хранения индексов и моделей
+# Глобальные переменные для хранения моделей и индексов
 embedder = None
 reranker = None
 tfidf_vectorizer = None
 tfidf_matrix = None
 faiss_index = None
 chunks_metadata = []
+translation_context_glossary = ""
 
 def initialize_models():
     """Инициализирует и кэширует модели в глобальных переменных."""
@@ -89,6 +88,20 @@ def initialize_models():
 def ensure_dir(path: str):
     Path(path).mkdir(parents=True, exist_ok=True)
 
+def extract_text_from_pdf_pages(pdf_path: str, num_pages: int = 5) -> str:
+    text_parts = []
+    try:
+        doc = fitz.open(pdf_path)
+        # Ограничиваем количество страниц для извлечения
+        page_count_to_process = min(len(doc), num_pages)
+        for i in range(page_count_to_process):
+            page_text = doc[i].get_text("text")
+            if page_text:
+                text_parts.append(page_text)
+        doc.close()
+    except Exception as e:
+        print(f"[WARN] Failed to parse initial pages from {pdf_path}: {e}")
+    return "\n".join(text_parts)
 
 # ---------------------------
 # PDF Loading & Text Extraction
@@ -150,400 +163,248 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
     chunks = [c.strip() for c in chunks if len(c.strip()) > 20]
     return chunks
 
-def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: bool = False):
+def create_translation_glossary(pdf_dir: str, api_key: str) -> str:
+    """Создает краткий глоссарий терминов из первых страниц документов."""
+    print("[INFO] Создание контекстного глоссария для переводчика...")
+    initial_texts = []
+    pdf_files = glob.glob(os.path.join(pdf_dir, "*.pdf"))
+    for pdf_path in pdf_files[:3]: # Берем первые 3 документа для скорости
+        initial_texts.append(extract_text_from_pdf_pages(pdf_path, num_pages=5))
+    
+    full_initial_text = "\n\n".join(initial_texts)
+    
+    # Ограничиваем текст, чтобы не превысить лимиты LLM
+    truncated_text = full_initial_text[:8000] 
+
+    prompt = f"""
+    Analyze the following text from a technical document about oil and gas software.
+    Identify and list the top 10-15 key technical terms, abbreviations, and concepts.
+    This list will be used as a glossary to help a translator accurately convert Russian questions into English search queries.
+    Return only the list of terms.
+
+    Text:
+    \"\"\"
+    {truncated_text}
+    \"\"\"
+
+    Key terms and glossary:
     """
-    Создает или загружает полную базу знаний, включая dense и sparse индексы.
-    Возвращает True, если база готова к использованию.
-    """
+
+    messages = [{"role": "system", "content": "You are a technical analyst."}, {"role": "user", "content": prompt}]
+    try:
+        response_json = call_openrouter_chat_completion(
+            api_key, OPENROUTER_MODEL, messages, extra_request_kwargs={"max_tokens": 500, "temperature": 0.1}
+        )
+        glossary = response_json.get("choices", [])[0].get("message", {}).get("content", "").strip()
+        print(f"[INFO] Глоссарий успешно создан:\n{glossary}")
+        return glossary
+    except Exception as e:
+        print(f"[WARN] Не удалось создать глоссарий: {e}")
+        return ""
+
+def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, api_key: str, force_rebuild: bool = False):
+    """Создает или загружает полную базу знаний, включая dense и sparse индексы."""
     global faiss_index, chunks_metadata, tfidf_vectorizer, tfidf_matrix
+    initialize_models()
 
-    initialize_models() # Убедимся, что модели загружены
-
-    # --- Пути к файлам ---
     ensure_dir(index_dir)
     faiss_path = os.path.join(index_dir, "index.faiss")
     metadata_path = os.path.join(index_dir, "metadata.pkl")
     tfidf_vec_path = os.path.join(index_dir, "tfidf_vectorizer.pkl")
     tfidf_matrix_path = os.path.join(index_dir, "tfidf_matrix.pkl")
+    glossary_path = os.path.join(index_dir, "glossary.txt")
 
     if force_rebuild:
         for path in [faiss_path, metadata_path, tfidf_vec_path, tfidf_matrix_path]:
-            if os.path.exists(path):
-                os.remove(path)
+            if os.path.exists(path): os.remove(path)
 
-    # --- Загрузка из кэша ---
     if all(os.path.exists(p) for p in [faiss_path, metadata_path, tfidf_vec_path, tfidf_matrix_path]):
         print("[INFO] Загрузка существующей базы знаний...")
         faiss_index = faiss.read_index(faiss_path)
-        with open(metadata_path, "rb") as f:
-            chunks_metadata = pickle.load(f)
-        with open(tfidf_vec_path, "rb") as f:
-            tfidf_vectorizer = pickle.load(f)
-        with open(tfidf_matrix_path, "rb") as f:
-            tfidf_matrix = pickle.load(f)
+        with open(metadata_path, "rb") as f: chunks_metadata = pickle.load(f)
+        with open(tfidf_vec_path, "rb") as f: tfidf_vectorizer = pickle.load(f)
+        with open(tfidf_matrix_path, "rb") as f: tfidf_matrix = pickle.load(f)
+        with open(glossary_path, "r", encoding="utf-8") as f: translation_context_glossary = f.read()
         print("[INFO] База знаний успешно загружена.")
         return True
 
-    # --- Создание новой базы ---
     print("[INFO] Создание новой базы знаний...")
     docs = load_pdfs_from_directory(pdf_dir)
-    if not docs:
-        raise RuntimeError(f"PDF-файлы не найдены в {pdf_dir}.")
+    if not docs: raise RuntimeError(f"PDF-файлы не найдены в {pdf_dir}.")
+    
+    translation_context_glossary = create_translation_glossary(pdf_dir, api_key)
+    with open(glossary_path, "w", encoding="utf-8") as f:
+        f.write(translation_context_glossary)
 
-    # 1. Чанкинг
-    all_chunks_text = []
-    chunks_metadata = []
-    for doc_id, (filename, text) in enumerate(docs.items()):
+    all_chunks_text, chunks_metadata = [], []
+    doc_counter = 0
+    for filename, text in docs.items():
         raw_chunks = chunk_text(text)
         for i, c_text in enumerate(raw_chunks):
-            chunks_metadata.append({"source": filename, "chunk_index": i, "text": c_text})
+            chunks_metadata.append({"source": filename, "chunk_index": doc_counter, "text": c_text})
             all_chunks_text.append(c_text)
-
+            doc_counter += 1
+            
     print(f"[INFO] Создано {len(all_chunks_text)} чанков.")
 
-    # 2. Создание Dense индекса (FAISS)
     print("[INFO] Создание Dense (векторного) индекса...")
     embeddings = embedder.encode(
         all_chunks_text, show_progress_bar=True, convert_to_numpy=True, normalize_embeddings=True
     ).astype("float32")
+    
+    # --- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ ---
+    # Используем быстрый HNSW-индекс вместо медленного IndexFlatIP
     dim = embeddings.shape[1]
-    faiss_index = faiss.IndexFlatIP(dim)
+    M = 64
+    faiss_index = faiss.IndexHNSWFlat(dim, M, faiss.METRIC_INNER_PRODUCT)
+    faiss_index.hnsw.efSearch = 128
     faiss_index.add(embeddings)
     faiss.write_index(faiss_index, faiss_path)
 
-    # 3. Создание Sparse индекса (TF-IDF)
     print("[INFO] Создание Sparse (TF-IDF) индекса...")
     tfidf_vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=2)
     tfidf_matrix = tfidf_vectorizer.fit_transform(all_chunks_text)
     with open(tfidf_vec_path, "wb") as f: pickle.dump(tfidf_vectorizer, f)
     with open(tfidf_matrix_path, "wb") as f: pickle.dump(tfidf_matrix, f)
 
-    # Сохраняем метаданные
     with open(metadata_path, "wb") as f: pickle.dump(chunks_metadata, f)
-
     print("[INFO] База знаний успешно создана и сохранена.")
     return True
-
-def hybrid_search(question: str) -> List[Dict[str, Any]]:
-    """
-    Выполняет гибридный поиск с последующим переранжированием.
-    """
-    global faiss_index, chunks_metadata, tfidf_vectorizer, tfidf_matrix, embedder, reranker
-
-    # 1. Dense Search
-    q_emb = embedder.encode([question], normalize_embeddings=True).astype("float32")
-    scores, indices = faiss_index.search(q_emb, TOP_K_RETRIEVAL)
-    dense_results = {idx: score for idx, score in zip(indices[0], scores[0]) if idx != -1}
-
-    # 2. Sparse Search
-    q_tfidf = tfidf_vectorizer.transform([question])
-    sparse_scores = cosine_similarity(q_tfidf, tfidf_matrix).flatten()
-    top_sparse_indices = np.argsort(sparse_scores)[-TOP_K_RETRIEVAL:][::-1]
-    sparse_results = {idx: sparse_scores[idx] for idx in top_sparse_indices if sparse_scores[idx] > 0}
-
-    # 3. Объединение и сборка кандидатов
-    all_indices = set(dense_results.keys()) | set(sparse_results.keys())
-    
-    candidates = []
-    for idx in all_indices:
-        candidate = chunks_metadata[idx].copy()
-        candidate['dense_score'] = dense_results.get(idx, 0.0)
-        candidate['sparse_score'] = sparse_results.get(idx, 0.0)
-        candidates.append(candidate)
-
-    # 4. Переранжирование (Reranking)
-    pairs = [(question, cand['text']) for cand in candidates]
-    if not pairs:
-        return []
-
-    rerank_scores = reranker.predict(pairs, show_progress_bar=False)
-
-    for cand, score in zip(candidates, rerank_scores):
-        cand['rerank_score'] = float(score)
-        # Комбинированный финальный скор: реранкер имеет наибольший вес
-        cand['final_score'] = 0.8 * cand['rerank_score'] + 0.15 * cand['dense_score'] + 0.05 * cand['sparse_score']
-
-    # 5. Сортировка и возврат лучших
-    candidates.sort(key=lambda x: x['final_score'], reverse=True)
-    return candidates[:TOP_K_FINAL]
-
-
-# ---------------------------
-# Embedding model wrapper
-# ---------------------------
-
-class LocalEmbedder:
-    def __init__(self, model_name: str = EMBEDDING_MODEL_NAME):
-        # Loads sentence-transformers model (local)
-        print(f"[INFO] Loading embedding model '{model_name}'...")
-        self.model = SentenceTransformer(model_name)
-
-    def embed_texts(self, texts: List[str]) -> np.ndarray:
-        """
-        Returns a numpy array of shape (len(texts), dim) dtype=float32
-        """
-        # sentence-transformers returns numpy arrays
-        embeddings = self.model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
-        # ensure float32
-        embeddings = embeddings.astype("float32")
-        return embeddings
-
-    def embed_text(self, text: str) -> np.ndarray:
-        emb = self.embed_texts([text])[0]
-        return emb
-
-
-# ---------------------------
-# FAISS index helpers
-# ---------------------------
-
-def _l2_normalize_vectors(vecs: np.ndarray) -> np.ndarray:
-    """
-    L2-normalize rows in-place and return them (for cosine similarity using inner product).
-    """
-    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-    # avoid division by zero
-    norms[norms == 0.0] = 1.0
-    return vecs / norms
-
-
-def build_faiss_index(embeddings: np.ndarray) -> faiss.Index:
-    """
-    Build a FAISS index for the provided embeddings.
-    We use IndexHNSWFlat, a fast and accurate index for Approximate Nearest Neighbor search.
-    """
-    dim = embeddings.shape[1]
-    
-    # M - это ключевой параметр HNSW, который контролирует количество "связей" у каждой точки в графе.
-    # Значение 32 или 64 является хорошим балансом между скоростью поиска и точностью.
-    M = 64  
-    
-    # Создаем индекс HNSW. Очень важно указать faiss.METRIC_INNER_PRODUCT,
-    # потому что мы используем нормализованные векторы и ищем максимальное скалярное произведение 
-    # (эквивалент косинусного сходства). По умолчанию используется L2 (евклидово расстояние).
-    index = faiss.IndexHNSWFlat(dim, M, faiss.METRIC_INNER_PRODUCT)
-    
-    # Настраиваем параметры HNSW для лучшей производительности во время поиска
-    index.hnsw.efSearch = 128 # Контролирует глубину поиска. Чем выше, тем точнее, но медленнее.
-    
-    print("[INFO] Building HNSW index...")
-    index.add(embeddings)
-    return index
-
-
-def save_faiss_index(index: faiss.Index, metadata: List[Dict[str, Any]], index_dir: str):
-    """
-    Persist FAISS index and metadata to disk.
-    """
-    ensure_dir(index_dir)
-    index_file = os.path.join(index_dir, "index.faiss")
-    meta_file = os.path.join(index_dir, "metadata.pkl")
-    print(f"[INFO] Saving FAISS index to {index_file}")
-    faiss.write_index(index, index_file)
-    print(f"[INFO] Saving metadata to {meta_file}")
-    with open(meta_file, "wb") as f:
-        pickle.dump(metadata, f)
-
-
-def load_faiss_index(index_dir: str) -> Tuple[Optional[faiss.Index], Optional[List[Dict[str, Any]]]]:
-    """
-    Load FAISS index and metadata from disk. Returns (index, metadata) or (None, None) if not found.
-    """
-    index_file = os.path.join(index_dir, "index.faiss")
-    meta_file = os.path.join(index_dir, "metadata.pkl")
-    if not os.path.exists(index_file) or not os.path.exists(meta_file):
-        return None, None
-    try:
-        print(f"[INFO] Loading FAISS index from {index_file}")
-        index = faiss.read_index(index_file)
-        with open(meta_file, "rb") as f:
-            metadata = pickle.load(f)
-        return index, metadata
-    except Exception as e:
-        print(f"[ERROR] Failed to load index/metadata: {e}")
-        return None, None
-
-
-# ---------------------------
-# Main orchestration: create or load vector store
-# ---------------------------
-
-def get_or_create_vector_store(pdf_dir: str = PDF_DIR,
-                               index_dir: str = VECTOR_STORE_PATH,
-                               embedder: Optional[LocalEmbedder] = None,
-                               chunk_size: int = CHUNK_SIZE,
-                               chunk_overlap: int = CHUNK_OVERLAP,force_rebuild: bool = False) -> Tuple[faiss.Index, List[Dict[str, Any]], LocalEmbedder]:
-    """
-    Main helper to either load an existing FAISS index + metadata or build a new one from PDFs.
-    Returns (index, metadata, embedder).
-    """
-    ensure_dir(index_dir)
-    if force_rebuild:
-        # удаляем старые файлы если есть
-        idx_file = os.path.join(index_dir, "index.faiss")
-        meta_file = os.path.join(index_dir, "metadata.pkl")
-        if os.path.exists(idx_file): os.remove(idx_file)
-        if os.path.exists(meta_file): os.remove(meta_file)
-
-    # Load embedder
-    if embedder is None:
-        embedder = LocalEmbedder(EMBEDDING_MODEL_NAME)
-
-    # Try to load existing
-    index, metadata = load_faiss_index(index_dir)
-    if index is not None and metadata is not None:
-        print("[INFO] Existing index loaded.")
-        return index, metadata, embedder
-
-    # Else: build fresh index
-    print("[INFO] Building a new FAISS index from PDFs...")
-
-    # 1) Load PDFs
-    docs = load_pdfs_from_directory(pdf_dir)
-    if not docs:
-        raise RuntimeError(f"No PDF texts found in {pdf_dir}. Please add PDFs and retry.")
-
-    # 2) Chunk documents
-    chunk_texts = []
-    metadata = []
-    doc_id = 0
-    for filename, text in docs.items():
-        chunks = chunk_text(text, chunk_size=chunk_size, overlap=chunk_overlap)
-        for i, c in enumerate(chunks):
-            meta = {
-                "doc_id": doc_id,
-                "source": filename,
-                "chunk_index": i,
-                "text": c  # store full chunk text so model receives whole chunk as context
-            }
-            chunk_texts.append(c)
-            metadata.append(meta)
-        doc_id += 1
-
-    print(f"[INFO] Created {len(chunk_texts)} chunks.")
-
-    # 3) Embed chunks (batch)
-    embeddings = []
-    BATCH = 64
-    for i in tqdm(range(0, len(chunk_texts), BATCH), desc="Embedding chunks"):
-        batch = chunk_texts[i:i+BATCH]
-        emb = embedder.embed_texts(batch)  # shape (batch_size, dim)
-        embeddings.append(emb)
-    embeddings = np.vstack(embeddings).astype("float32")
-    # Normalize embeddings for cosine-sim via inner product
-    embeddings = _l2_normalize_vectors(embeddings)
-
-    # 4) Build FAISS index and persist
-    index = build_faiss_index(embeddings)
-    save_faiss_index(index, metadata, index_dir)
-
-    print("[INFO] FAISS index built and saved.")
-    return index, metadata, embedder
-
-
-# ---------------------------
-# RAG chain & retrieval
-# ---------------------------
-
-def retrieve_relevant_chunks(question: str,
-                             index: faiss.Index,
-                             metadata: List[Dict[str, Any]],
-                             embedder: LocalEmbedder,
-                             top_k: int = TOP_K) -> List[Dict[str, Any]]:
-    """
-    Given a question, embed it, query FAISS and return a list of metadata dicts for top_k results.
-    Each returned dict will have keys: 'score' (similarity) and metadata fields.
-    """
-    q_emb = embedder.embed_text(question).astype("float32")
-    # normalize
-    q_emb = q_emb / (np.linalg.norm(q_emb) + 1e-12)
-    q_emb = q_emb.reshape(1, -1)
-
-    D, I = index.search(q_emb, top_k)  # D: similarities (inner product), I: indices
-    results = []
-    for score, idx in zip(D[0], I[0]):
-        if idx < 0 or idx >= len(metadata):
-            continue
-        meta = dict(metadata[idx])  # copy
-        meta["score"] = float(score)
-        results.append(meta)
-    return results
-
 
 # ---------------------------
 # OpenRouter call (Chat Completions)
 # ---------------------------
 
-def call_openrouter_chat_completion(api_key: str,
-                                    model: str,
-                                    messages: List[Dict[str, str]],
-                                    endpoint: str = OPENROUTER_ENDPOINT,
-                                    extra_request_kwargs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    Calls OpenRouter chat completions (OpenAI-compatible) and returns the JSON response.
-    This function uses the /chat/completions endpoint.
-    """
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": model,
-        "messages": messages,
-    }
-    if extra_request_kwargs:
-        payload.update(extra_request_kwargs)
-
-    resp = requests.post(endpoint, headers=headers, json=payload, timeout=60)
+def call_openrouter_chat_completion(api_key, model, messages, endpoint=OPENROUTER_ENDPOINT, extra_request_kwargs=None):
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {"model": model, "messages": messages}
+    if extra_request_kwargs: payload.update(extra_request_kwargs)
     try:
+        resp = requests.post(endpoint, headers=headers, json=payload, timeout=60)
         resp.raise_for_status()
+        return resp.json()
     except Exception as e:
-        # surface detailed error
-        raise RuntimeError(f"OpenRouter API request failed: {e}. Response content: {resp.text}")
-    return resp.json()
+        raise RuntimeError(f"OpenRouter API request failed: {e}. Response: {resp.text if 'resp' in locals() else 'No response'}")
 
 
 # ---------------------------
 # RAG chain creation wrapper
 # ---------------------------
 
+# Новая функция гибридного поиска, которая будет вызываться из answer_question
+def hybrid_search_with_rerank(question: str) -> List[Dict[str, Any]]:
+    
+    # --- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Защита от пустого запроса ---
+    if not question or not question.strip():
+        print("[WARN] Получен пустой поисковый запрос. Поиск не будет выполнен.")
+        return []
+
+    global faiss_index, chunks_metadata, tfidf_vectorizer, tfidf_matrix, embedder, reranker
+
+    # 1. Dense Search
+    q_emb = embedder.encode([question], normalize_embeddings=True).astype("float32")
+    scores, indices = faiss_index.search(q_emb, TOP_K_RETRIEVAL)
+    dense_map = {idx: score for idx, score in zip(indices[0], scores[0]) if idx != -1}
+
+    # 2. Sparse Search
+    q_tfidf = tfidf_vectorizer.transform([question])
+    sparse_scores = cosine_similarity(q_tfidf, tfidf_matrix).flatten()
+    top_sparse_indices = np.argsort(sparse_scores)[-TOP_K_RETRIEVAL:][::-1]
+    sparse_map = {idx: sparse_scores[idx] for idx in top_sparse_indices if sparse_scores[idx] > 0}
+    
+    # 3. Объединение кандидатов
+    all_indices = set(dense_map.keys()) | set(sparse_map.keys())
+    candidates = []
+    for idx in all_indices:
+        if idx < len(chunks_metadata):
+            candidate = chunks_metadata[idx].copy()
+            candidate['dense_score'] = dense_map.get(idx, 0.0)
+            candidate['sparse_score'] = sparse_map.get(idx, 0.0)
+            candidates.append(candidate)
+
+    if not candidates: return []
+
+    # 4. Переранжирование (Reranking)
+    pairs = [(question, cand['text']) for cand in candidates]
+    rerank_scores = reranker.predict(pairs, show_progress_bar=False)
+    for cand, score in zip(candidates, rerank_scores):
+        cand['final_score'] = float(score)
+
+    candidates.sort(key=lambda x: x['final_score'], reverse=True)
+    return candidates[:TOP_K_FINAL]
+
 # --- ГЛАВНАЯ ОБНОВЛЕННАЯ ФУНКЦИЯ ---
 def create_rag_chain(openrouter_api_key: str, openrouter_model: str = OPENROUTER_MODEL):
     """
     Создает RAG-цепочку, интегрируя перевод, гибридный поиск и переранжирование.
     """
+    
+    translation_cache = {}
 
     def translate_query_to_english(question: str) -> str:
-        """Ваша функция перевода (без изменений)."""
+        global translation_context_glossary
+        if question in translation_cache: return translation_cache[question]
+        
         try:
             if sum(1 for char in question if 'а' <= char.lower() <= 'я') < len(question) / 4:
-                print("[INFO] Запрос уже на английском, перевод не требуется.")
                 return question
         except Exception: pass
 
-        print(f"[INFO] Переводим запрос на английский: '{question}'")
-        prompt = f"Translate the following user question into English. Return ONLY the translated text, without any explanation or quotation marks.\n\nUser question: \"{question}\"\n\nEnglish translation:"
-        messages = [{"role": "system", "content": "You are a helpful translation assistant."}, {"role": "user", "content": prompt}]
+        print(f"[INFO] Контекстуальный перевод запроса: '{question}'")
+        
+        # НОВОЕ: Улучшенный промпт с глоссарием
+        prompt = f"""
+        You are an expert technical translator. Your task is to translate a Russian user question into an English search query.
+        The query will be used to search in software documentation for the oil and gas industry.
+        Use the provided glossary to ensure high accuracy of technical terms.
+
+        **Glossary of key terms:**
+        \"\"\"
+        {translation_context_glossary}
+        \"\"\"
+
+        **User question in Russian:** "{question}"
+
+        **Instructions:**
+        - Translate the Russian question into a concise, clear English search query.
+        - Prioritize correct technical terminology based on the glossary.
+        - Return ONLY the translated text, without any explanations or quotation marks.
+
+        **English search query:**
+        """
+        messages = [{"role": "system", "content": "You are a helpful and expert technical translator."}, {"role": "user", "content": prompt}]
         
         try:
             response_json = call_openrouter_chat_completion(
                 api_key=openrouter_api_key, model=openrouter_model, messages=messages,
                 extra_request_kwargs={"max_tokens": 100, "temperature": 0.0}
             )
-            translation = response_json.get("choices", [])[0].get("message", {}).get("content", "").strip()
-            print(f"[INFO] Переведенный запрос: '{translation}'")
-            return translation if translation else question
+            # --- УЛУЧШЕНИЕ: Более надежный парсинг ---
+            raw_translation = response_json.get("choices", [])[0].get("message", {}).get("content", "")
+            
+            # Сначала убираем возможные кавычки и пробелы
+            clean_translation = raw_translation.strip('" ')
+            
+            print(f"[DEBUG] Raw translation from LLM: '{raw_translation}'")
+            
+            # Если после очистки что-то осталось, используем это
+            if clean_translation:
+                print(f"[INFO] Переведенный запрос: '{clean_translation}'")
+                translation_cache[question] = clean_translation
+                return clean_translation
+            else:
+                # Если перевод пустой, логируем и возвращаем ОРИГИНАЛ
+                print(f"[WARN] Переводчик вернул пустой результат. Используется оригинальный вопрос.")
+                translation_cache[question] = question # Кэшируем оригинал, чтобы не пытаться переводить снова
+                return question
+
         except Exception as e:
-            print(f"[WARN] Не удалось перевести запрос, используется оригинал: {e}")
+            print(f"[WARN] Не удалось перевести запрос: {e}. Используется оригинальный вопрос.")
             return question
     
     def answer_question(question: str) -> tuple[str, str]:
-        # --- ШАГ 1: ПЕРЕВОД ЗАПРОСА ---
         english_question = translate_query_to_english(question)
-
-        # --- ШАГ 2: ГИБРИДНЫЙ ПОИСК И ПЕРЕРАНЖИРОВАНИЕ ---
-        # Мы вызываем новую мощную функцию вместо старого retrieve_relevant_chunks
-        retrieved = hybrid_search_with_rerank(english_question, TOP_K_RETRIEVAL, TOP_K_FINAL)
+        retrieved = hybrid_search_with_rerank(english_question) # <-- Теперь это безопасно
         
         if not retrieved:
             return "На основе предоставленных документов я не могу найти ответ на этот вопрос.", "Контекст не был найден в базе знаний."
@@ -639,13 +500,10 @@ def create_rag_chain(openrouter_api_key: str, openrouter_model: str = OPENROUTER
 # ---------------------------
 
 def _load_api_key_from_env() -> str:
-    """
-    Loads OPENROUTER_API_KEY from environment (via .env if present).
-    """
     load_dotenv()
-    key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY") or None
+    key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY")
     if not key:
-        raise RuntimeError("OPENROUTER_API_KEY not found in environment. Create a .env file with OPENROUTER_API_KEY=your_key")
+        raise RuntimeError("OPENROUTER_API_KEY не найден в .env файле.")
     return key
 
 

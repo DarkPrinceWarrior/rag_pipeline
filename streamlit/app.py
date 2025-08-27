@@ -1,11 +1,9 @@
 # streamlit/app.py
+# streamlit/app.py
 import streamlit as st
 import os
 from pathlib import Path
 import shutil
-# Важно: Нам нужно получить не только ответ, но и контекст для отладки
-from rag_core import get_or_create_vector_store, create_rag_chain
-
 # Импортируем обновленные функции
 from rag_core import build_and_load_knowledge_base, create_rag_chain, _load_api_key_from_env
 
@@ -84,20 +82,18 @@ if process_button:
             with open(PDF_DIR / uploaded_file.name, "wb") as f:
                 f.write(uploaded_file.getbuffer())
         
-        with st.spinner("Идёт обработка документов... Это может занять некоторое время."):
+        with st.spinner("Создание базы знаний и контекстного глоссария... Это может занять время."):
             try:
-                # Используем новую функцию для построения/загрузки базы знаний
+                # НОВОЕ: передаем API ключ для создания глоссария
                 build_and_load_knowledge_base(
                     pdf_dir=PDF_DIR,
                     index_dir=VECTOR_STORE_PATH,
+                    api_key=st.session_state.openrouter_api_key,
                     force_rebuild=True
                 )
-                # Создаем цепочку
-                st.session_state.rag_chain = create_rag_chain(
-                    openrouter_api_key=st.session_state.openrouter_api_key
-                )
+                st.session_state.rag_chain = create_rag_chain(st.session_state.openrouter_api_key)
                 st.session_state.messages = []
-                st.success("База знаний успешно создана! Теперь вы можете задавать вопросы.")
+                st.success("База знаний и глоссарий успешно созданы!")
             except Exception as e:
                 st.error(f"Произошла ошибка при обработке документов: {e}")
                 if VECTOR_STORE_PATH.exists():
@@ -106,12 +102,17 @@ if process_button:
 # --- Загрузка базы знаний при первом запуске, если она уже есть ---
 if st.session_state.rag_chain is None and 'openrouter_api_key' in st.session_state:
     try:
-        # Пытаемся загрузить без перестройки
-        if build_and_load_knowledge_base(pdf_dir=PDF_DIR, index_dir=VECTOR_STORE_PATH, force_rebuild=False):
+        # НОВОЕ: передаем API ключ
+        if build_and_load_knowledge_base(
+            pdf_dir=PDF_DIR,
+            index_dir=VECTOR_STORE_PATH,
+            api_key=st.session_state.openrouter_api_key,
+            force_rebuild=False
+        ):
             st.session_state.rag_chain = create_rag_chain(st.session_state.openrouter_api_key)
-            st.info("Существующая база знаний загружена. Готов к работе!")
+            st.toast("✅ Существующая база знаний и глоссарий загружены.", icon="📚")
     except Exception as e:
-        st.warning(f"Не удалось загрузить существующую базу знаний: {e}. Пожалуйста, загрузите файлы и обработайте их.")
+        st.warning(f"Не удалось загрузить базу знаний: {e}. Пожалуйста, обработайте файлы заново.")
 
 # --- Отображение чата и обработка запросов ---
 st.header("Диалог")

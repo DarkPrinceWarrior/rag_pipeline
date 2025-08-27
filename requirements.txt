@@ -1,0 +1,10 @@
+faiss-cpu
+langchain
+numpy
+pymupdf
+python-dotenv
+requests
+sentence-transformers
+streamlit
+tqdm
+scikit-learn

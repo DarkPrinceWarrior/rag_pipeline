@@ -3,12 +3,12 @@ requirements.txt
 ----------------
 langchain
 langchain-community
-pymupdf
+langchain-docling
 sentence-transformers
 python-dotenv
 faiss-cpu
 requests
-tqdm
+docling
 """
 
 # rag_app.py
@@ -31,26 +31,23 @@ tqdm
 
 import os
 import glob
-import fitz  # PyMuPDF
 import faiss
 import pickle
 import json
 import requests
 from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any
 import numpy as np
 from dotenv import load_dotenv
-from tqdm import tqdm
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from docling.document_converter import DocumentConverter
+from langchain_docling import DoclingLoader
 
 # ---------------------------
 # Configuration (change if needed)
 # ---------------------------
-from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parents[1]
 PDF_DIR = str(BASE_DIR / "pdfs")
 VECTOR_STORE_PATH = str(BASE_DIR / "faiss_index")  # directory where index and metadata are stored
@@ -76,10 +73,8 @@ def initialize_models():
     """Инициализирует и кэширует модели в глобальных переменных."""
     global embedder, reranker
     if embedder is None:
-        print(f"[INFO] Загрузка embedding модели '{EMBEDDING_MODEL_NAME}'...")
         embedder = SentenceTransformer(EMBEDDING_MODEL_NAME, trust_remote_code=True)
     if reranker is None:
-        print(f"[INFO] Загрузка reranker модели '{RERANKER_MODEL_NAME}'...")
         reranker = CrossEncoder(RERANKER_MODEL_NAME)
 
 # ---------------------------
@@ -90,43 +85,40 @@ def ensure_dir(path: str):
     Path(path).mkdir(parents=True, exist_ok=True)
 
 def extract_text_from_pdf_pages(pdf_path: str, num_pages: int = 5) -> str:
-    text_parts = []
+    """
+    Извлекает приблизительно первые N страниц PDF, используя LangChain Docling loader.
+    Возвращает markdown-текст.
+    """
     try:
-        doc = fitz.open(pdf_path)
-        # Ограничиваем количество страниц для извлечения
-        page_count_to_process = min(len(doc), num_pages)
-        for i in range(page_count_to_process):
-            page_text = doc[i].get_text("text")
-            if page_text:
-                text_parts.append(page_text)
-        doc.close()
-    except Exception as e:
-        print(f"[WARN] Failed to parse initial pages from {pdf_path}: {e}")
-    return "\n".join(text_parts)
-
+        loader = DoclingLoader(file_path=[pdf_path])
+        docs = loader.load()
+        if not docs:
+            return ""
+        full_text = "\n\n".join(d.page_content for d in docs if d.page_content and d.page_content.strip())
+        if not full_text:
+            return ""
+        blocks = full_text.split('\n\n')
+        selected = '\n\n'.join(blocks[:min(num_pages * 3, len(blocks))])
+        return selected.strip()
+    except Exception:
+        return ""
 # ---------------------------
 # PDF Loading & Text Extraction
 # ---------------------------
 
 def extract_text_from_pdf(pdf_path: str) -> str:
     """
-    Извлекает структурированный текст из PDF с сохранением форматирования.
-    Использует Docling для сохранения заголовков, таблиц, списков.
+    Извлекает структурированный текст из PDF в markdown с сохранением форматирования,
+    используя LangChain Docling loader.
     """
     try:
-        # Инициализируем конвертер с оптимальными настройками
-        converter = DocumentConverter()
-        
-        # Конвертируем документ
-        result = converter.convert(pdf_path)
-        
-        # Получаем структурированный текст в формате Markdown
-        markdown_content = result.document.export_to_markdown()
-        
-        return markdown_content
-    
-    except Exception as e:
-        print(f"[ERROR] Ошибка при обработке {pdf_path}: {e}")
+        loader = DoclingLoader(file_path=[pdf_path])
+        docs = loader.load()
+        if not docs:
+            return ""
+        text = "\n\n".join(d.page_content for d in docs if d.page_content and d.page_content.strip())
+        return text.strip()
+    except Exception:
         return ""
 
 
@@ -142,8 +134,6 @@ def load_pdfs_from_directory(directory: str) -> Dict[str, str]:
         text = extract_text_from_pdf(p)
         if text.strip():
             docs[filename] = text
-        else:
-            print(f"[INFO] No text extracted from {filename} (may be scanned images).")
     return docs
 
 
@@ -169,7 +159,6 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
 
 def create_translation_glossary(pdf_dir: str, api_key: str) -> str:
     """Создает краткий глоссарий терминов из первых страниц документов."""
-    print("[INFO] Создание контекстного глоссария для переводчика...")
     initial_texts = []
     pdf_files = glob.glob(os.path.join(pdf_dir, "*.pdf"))
     for pdf_path in pdf_files[:3]: # Берем первые 3 документа для скорости
@@ -181,7 +170,7 @@ def create_translation_glossary(pdf_dir: str, api_key: str) -> str:
     truncated_text = full_initial_text[:8000] 
 
     prompt = f"""
-    Analyze the following text from a technical document about oil and gas software.
+    Analyze the following text from a document.
     Identify and list the top 10-15 key technical terms, abbreviations, and concepts.
     This list will be used as a glossary to help a translator accurately convert Russian questions into English search queries.
     Return only the list of terms.
@@ -197,18 +186,16 @@ def create_translation_glossary(pdf_dir: str, api_key: str) -> str:
     messages = [{"role": "system", "content": "You are a technical analyst."}, {"role": "user", "content": prompt}]
     try:
         response_json = call_openrouter_chat_completion(
-            api_key, OPENROUTER_MODEL, messages, extra_request_kwargs={"max_tokens": 500, "temperature": 0.1}
+            api_key, OPENROUTER_MODEL, messages, extra_request_kwargs={"max_tokens": 500, "temperature": 0.2}
         )
         glossary = response_json.get("choices", [])[0].get("message", {}).get("content", "").strip()
-        print(f"[INFO] Глоссарий успешно создан:\n{glossary}")
         return glossary
     except Exception as e:
-        print(f"[WARN] Не удалось создать глоссарий: {e}")
         return ""
 
 def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, api_key: str, force_rebuild: bool = False):
     """Создает или загружает полную базу знаний, включая dense и sparse индексы."""
-    global faiss_index, chunks_metadata, tfidf_vectorizer, tfidf_matrix
+    global faiss_index, chunks_metadata, tfidf_vectorizer, tfidf_matrix, translation_context_glossary
     initialize_models()
 
     ensure_dir(index_dir)
@@ -223,16 +210,13 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, api_key: str, fo
             if os.path.exists(path): os.remove(path)
 
     if all(os.path.exists(p) for p in [faiss_path, metadata_path, tfidf_vec_path, tfidf_matrix_path]):
-        print("[INFO] Загрузка существующей базы знаний...")
         faiss_index = faiss.read_index(faiss_path)
         with open(metadata_path, "rb") as f: chunks_metadata = pickle.load(f)
         with open(tfidf_vec_path, "rb") as f: tfidf_vectorizer = pickle.load(f)
         with open(tfidf_matrix_path, "rb") as f: tfidf_matrix = pickle.load(f)
         with open(glossary_path, "r", encoding="utf-8") as f: translation_context_glossary = f.read()
-        print("[INFO] База знаний успешно загружена.")
         return True
 
-    print("[INFO] Создание новой базы знаний...")
     docs = load_pdfs_from_directory(pdf_dir)
     if not docs: raise RuntimeError(f"PDF-файлы не найдены в {pdf_dir}.")
     
@@ -249,15 +233,13 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, api_key: str, fo
             all_chunks_text.append(c_text)
             doc_counter += 1
             
-    print(f"[INFO] Создано {len(all_chunks_text)} чанков.")
-
-    print("[INFO] Создание Dense (векторного) индекса...")
+    # Создание Dense (векторного) индекса
     # ИЗМЕНЕНО: Используем Jina v4 с task="retrieval" и prompt_name="passage" для документов
     embeddings = embedder.encode(
         sentences=all_chunks_text,
         task="retrieval",
         prompt_name="passage",
-        show_progress_bar=True,
+        show_progress_bar=False,
         convert_to_numpy=True,
         normalize_embeddings=True
     ).astype("float32")
@@ -271,14 +253,12 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, api_key: str, fo
     faiss_index.add(embeddings)
     faiss.write_index(faiss_index, faiss_path)
 
-    print("[INFO] Создание Sparse (TF-IDF) индекса...")
     tfidf_vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=2)
     tfidf_matrix = tfidf_vectorizer.fit_transform(all_chunks_text)
     with open(tfidf_vec_path, "wb") as f: pickle.dump(tfidf_vectorizer, f)
     with open(tfidf_matrix_path, "wb") as f: pickle.dump(tfidf_matrix, f)
 
     with open(metadata_path, "wb") as f: pickle.dump(chunks_metadata, f)
-    print("[INFO] База знаний успешно создана и сохранена.")
     return True
 
 # ---------------------------
@@ -306,7 +286,6 @@ def hybrid_search_with_rerank(question: str) -> List[Dict[str, Any]]:
     
     # --- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Защита от пустого запроса ---
     if not question or not question.strip():
-        print("[WARN] Получен пустой поисковый запрос. Поиск не будет выполнен.")
         return []
 
     global faiss_index, chunks_metadata, tfidf_vectorizer, tfidf_matrix, embedder, reranker
@@ -366,12 +345,9 @@ def create_rag_chain(openrouter_api_key: str, openrouter_model: str = OPENROUTER
                 return question
         except Exception: pass
 
-        print(f"[INFO] Контекстуальный перевод запроса: '{question}'")
-        
         # НОВОЕ: Улучшенный промпт с глоссарием
         prompt = f"""
         You are an expert technical translator. Your task is to translate a Russian user question into an English search query.
-        The query will be used to search in software documentation for the oil and gas industry.
         Use the provided glossary to ensure high accuracy of technical terms.
 
         **Glossary of key terms:**
@@ -382,7 +358,7 @@ def create_rag_chain(openrouter_api_key: str, openrouter_model: str = OPENROUTER
         **User question in Russian:** "{question}"
 
         **Instructions:**
-        - Translate the Russian question into a concise, clear English search query.
+        - Translate the Russian question into a clear English search query.
         - Prioritize correct technical terminology based on the glossary.
         - Return ONLY the translated text, without any explanations or quotation marks.
 
@@ -393,7 +369,7 @@ def create_rag_chain(openrouter_api_key: str, openrouter_model: str = OPENROUTER
         try:
             response_json = call_openrouter_chat_completion(
                 api_key=openrouter_api_key, model=openrouter_model, messages=messages,
-                extra_request_kwargs={"max_tokens": 100, "temperature": 0.0}
+                extra_request_kwargs={"max_tokens": 500, "temperature": 0.2}
             )
             # --- УЛУЧШЕНИЕ: Более надежный парсинг ---
             raw_translation = response_json.get("choices", [])[0].get("message", {}).get("content", "")
@@ -401,21 +377,16 @@ def create_rag_chain(openrouter_api_key: str, openrouter_model: str = OPENROUTER
             # Сначала убираем возможные кавычки и пробелы
             clean_translation = raw_translation.strip('" ')
             
-            print(f"[DEBUG] Raw translation from LLM: '{raw_translation}'")
-            
             # Если после очистки что-то осталось, используем это
             if clean_translation:
-                print(f"[INFO] Переведенный запрос: '{clean_translation}'")
                 translation_cache[question] = clean_translation
                 return clean_translation
             else:
-                # Если перевод пустой, логируем и возвращаем ОРИГИНАЛ
-                print(f"[WARN] Переводчик вернул пустой результат. Используется оригинальный вопрос.")
-                translation_cache[question] = question # Кэшируем оригинал, чтобы не пытаться переводить снова
+                # Если перевод пустой, возвращаем оригинальный вопрос и кэшируем его
+                translation_cache[question] = question
                 return question
 
         except Exception as e:
-            print(f"[WARN] Не удалось перевести запрос: {e}. Используется оригинальный вопрос.")
             return question
     
     def answer_question(question: str) -> tuple[str, str]:

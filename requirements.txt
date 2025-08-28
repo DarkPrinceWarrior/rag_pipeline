@@ -14,3 +14,4 @@ peft
 torchvision
 pillow
 docling
+langchain-docling

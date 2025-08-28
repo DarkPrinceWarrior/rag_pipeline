@@ -45,6 +45,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from docling.document_converter import DocumentConverter
 
 # ---------------------------
 # Configuration (change if needed)
@@ -53,8 +54,8 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parents[1]
 PDF_DIR = str(BASE_DIR / "pdfs")
 VECTOR_STORE_PATH = str(BASE_DIR / "faiss_index")  # directory where index and metadata are stored
-EMBEDDING_MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
-RERANKER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2" # <-- Новая модель
+EMBEDDING_MODEL_NAME = "jinaai/jina-embeddings-v4"  # <-- ИЗМЕНЕНО: Замена на Jina v4
+RERANKER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 TOP_K_RETRIEVAL = 15
@@ -109,21 +110,24 @@ def extract_text_from_pdf_pages(pdf_path: str, num_pages: int = 5) -> str:
 
 def extract_text_from_pdf(pdf_path: str) -> str:
     """
-    Extracts all text from a PDF file using PyMuPDF.
-    Returns a single string with the file's full text.
+    Извлекает структурированный текст из PDF с сохранением форматирования.
+    Использует Docling для сохранения заголовков, таблиц, списков.
     """
-    text_parts = []
     try:
-        doc = fitz.open(pdf_path)
-        for page in doc:
-            # getText("text") is robust for text extraction
-            page_text = page.get_text("text")
-            if page_text:
-                text_parts.append(page_text)
-        doc.close()
+        # Инициализируем конвертер с оптимальными настройками
+        converter = DocumentConverter()
+        
+        # Конвертируем документ
+        result = converter.convert(pdf_path)
+        
+        # Получаем структурированный текст в формате Markdown
+        markdown_content = result.document.export_to_markdown()
+        
+        return markdown_content
+    
     except Exception as e:
-        print(f"[WARN] Failed to parse {pdf_path}: {e}")
-    return "\n".join(text_parts)
+        print(f"[ERROR] Ошибка при обработке {pdf_path}: {e}")
+        return ""
 
 
 def load_pdfs_from_directory(directory: str) -> Dict[str, str]:
@@ -248,8 +252,14 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, api_key: str, fo
     print(f"[INFO] Создано {len(all_chunks_text)} чанков.")
 
     print("[INFO] Создание Dense (векторного) индекса...")
+    # ИЗМЕНЕНО: Используем Jina v4 с task="retrieval" и prompt_name="passage" для документов
     embeddings = embedder.encode(
-        all_chunks_text, show_progress_bar=True, convert_to_numpy=True, normalize_embeddings=True
+        sentences=all_chunks_text,
+        task="retrieval",
+        prompt_name="passage",
+        show_progress_bar=True,
+        convert_to_numpy=True,
+        normalize_embeddings=True
     ).astype("float32")
     
     # --- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ ---
@@ -302,7 +312,13 @@ def hybrid_search_with_rerank(question: str) -> List[Dict[str, Any]]:
     global faiss_index, chunks_metadata, tfidf_vectorizer, tfidf_matrix, embedder, reranker
 
     # 1. Dense Search
-    q_emb = embedder.encode([question], normalize_embeddings=True).astype("float32")
+    # ИЗМЕНЕНО: Используем Jina v4 с task="retrieval" и prompt_name="query" для запросов
+    q_emb = embedder.encode(
+        sentences=[question], 
+        task="retrieval", 
+        prompt_name="query", 
+        normalize_embeddings=True
+    ).astype("float32")
     scores, indices = faiss_index.search(q_emb, TOP_K_RETRIEVAL)
     dense_map = {idx: score for idx, score in zip(indices[0], scores[0]) if idx != -1}
 

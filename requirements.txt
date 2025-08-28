@@ -8,3 +8,9 @@ sentence-transformers
 streamlit
 tqdm
 scikit-learn
+transformers
+torch
+peft
+torchvision
+pillow
+docling

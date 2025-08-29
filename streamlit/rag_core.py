@@ -1,33 +1,3 @@
-"""
-requirements.txt
-----------------
-langchain
-langchain-community
-langchain-docling
-sentence-transformers
-python-dotenv
-faiss-cpu
-requests
-docling
-"""
-
-# rag_app.py
-# Full, runnable RAG script:
-# - loads PDFs from a local directory
-# - chunks text (chunk ~1000 chars, overlap ~200)
-# - creates sentence-transformers embeddings (all-MiniLM-L6-v2)
-# - stores embeddings in a local FAISS index and persists metadata
-# - when a question is given: embeds it, searches FAISS, constructs context
-# - calls OpenRouter chat completions endpoint with model (mistralai/mistral-medium)
-#
-# Notes:
-# - Put your OpenRouter API key into a .env file as: OPENROUTER_API_KEY=sk-...
-# - The script is intentionally modular; main functions:
-#     get_or_create_vector_store(...)
-#     create_rag_chain(...)
-#     answer_question(...)
-#
-# Author: generated following specification
 
 import os
 import glob
@@ -41,9 +11,8 @@ import numpy as np
 from dotenv import load_dotenv
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer, CrossEncoder
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 from langchain_docling import DoclingLoader
+import bm25s
 
 # ---------------------------
 # Configuration (change if needed)
@@ -63,11 +32,13 @@ OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 # Глобальные переменные для хранения моделей и индексов
 embedder = None
 reranker = None
-tfidf_vectorizer = None
-tfidf_matrix = None
 faiss_index = None
 chunks_metadata = []
 translation_context_glossary = ""
+
+# BM25S глобальные объекты
+bm25_retriever = None
+bm25_corpus_ids: List[int] = []
 
 def initialize_models():
     """Инициализирует и кэширует модели в глобальных переменных."""
@@ -195,27 +166,40 @@ def create_translation_glossary(pdf_dir: str, api_key: str) -> str:
 
 def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, api_key: str, force_rebuild: bool = False):
     """Создает или загружает полную базу знаний, включая dense и sparse индексы."""
-    global faiss_index, chunks_metadata, tfidf_vectorizer, tfidf_matrix, translation_context_glossary
+    global faiss_index, chunks_metadata, translation_context_glossary, bm25_retriever, bm25_corpus_ids
     initialize_models()
 
     ensure_dir(index_dir)
     faiss_path = os.path.join(index_dir, "index.faiss")
     metadata_path = os.path.join(index_dir, "metadata.pkl")
-    tfidf_vec_path = os.path.join(index_dir, "tfidf_vectorizer.pkl")
-    tfidf_matrix_path = os.path.join(index_dir, "tfidf_matrix.pkl")
+    bm25_dir = os.path.join(index_dir, "bm25")
     glossary_path = os.path.join(index_dir, "glossary.txt")
 
     if force_rebuild:
-        for path in [faiss_path, metadata_path, tfidf_vec_path, tfidf_matrix_path]:
+        for path in [faiss_path, metadata_path]:
             if os.path.exists(path): os.remove(path)
+        if os.path.isdir(bm25_dir):
+            # Полное удаление каталога BM25 индекса
+            for root, _, files in os.walk(bm25_dir, topdown=False):
+                for name in files:
+                    os.remove(os.path.join(root, name))
+            os.rmdir(bm25_dir)
 
-    if all(os.path.exists(p) for p in [faiss_path, metadata_path, tfidf_vec_path, tfidf_matrix_path]):
+    bm25_loaded = False
+    if os.path.exists(faiss_path) and os.path.exists(metadata_path) and os.path.isdir(bm25_dir):
         faiss_index = faiss.read_index(faiss_path)
         with open(metadata_path, "rb") as f: chunks_metadata = pickle.load(f)
-        with open(tfidf_vec_path, "rb") as f: tfidf_vectorizer = pickle.load(f)
-        with open(tfidf_matrix_path, "rb") as f: tfidf_matrix = pickle.load(f)
+        # Загрузка BM25 индекса и ID корпуса
+        try:
+            bm25_retriever = bm25s.BM25.load(bm25_dir, load_corpus=True, mmap=True)
+            # BM25S сохраняет корпус; мы ожидаем, что там лежат chunk_id
+            bm25_corpus_ids = list(bm25_retriever.corpus) if hasattr(bm25_retriever, "corpus") else []
+            bm25_loaded = True
+        except Exception:
+            bm25_loaded = False
         with open(glossary_path, "r", encoding="utf-8") as f: translation_context_glossary = f.read()
-        return True
+        if bm25_loaded:
+            return True
 
     docs = load_pdfs_from_directory(pdf_dir)
     if not docs: raise RuntimeError(f"PDF-файлы не найдены в {pdf_dir}.")
@@ -253,10 +237,13 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, api_key: str, fo
     faiss_index.add(embeddings)
     faiss.write_index(faiss_index, faiss_path)
 
-    tfidf_vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=2)
-    tfidf_matrix = tfidf_vectorizer.fit_transform(all_chunks_text)
-    with open(tfidf_vec_path, "wb") as f: pickle.dump(tfidf_vectorizer, f)
-    with open(tfidf_matrix_path, "wb") as f: pickle.dump(tfidf_matrix, f)
+    # Построение BM25S sparse-индекса
+    bm25_corpus_ids = list(range(len(all_chunks_text)))
+    corpus_tokens = bm25s.tokenize(all_chunks_text)
+    bm25_retriever = bm25s.BM25(method="lucene")
+    bm25_retriever.index(corpus_tokens)
+    ensure_dir(bm25_dir)
+    bm25_retriever.save(bm25_dir, corpus=bm25_corpus_ids)
 
     with open(metadata_path, "wb") as f: pickle.dump(chunks_metadata, f)
     return True
@@ -288,7 +275,7 @@ def hybrid_search_with_rerank(question: str) -> List[Dict[str, Any]]:
     if not question or not question.strip():
         return []
 
-    global faiss_index, chunks_metadata, tfidf_vectorizer, tfidf_matrix, embedder, reranker
+    global faiss_index, chunks_metadata, embedder, reranker, bm25_retriever, bm25_corpus_ids
 
     # 1. Dense Search
     # ИЗМЕНЕНО: Используем Jina v4 с task="retrieval" и prompt_name="query" для запросов
@@ -301,11 +288,17 @@ def hybrid_search_with_rerank(question: str) -> List[Dict[str, Any]]:
     scores, indices = faiss_index.search(q_emb, TOP_K_RETRIEVAL)
     dense_map = {idx: score for idx, score in zip(indices[0], scores[0]) if idx != -1}
 
-    # 2. Sparse Search
-    q_tfidf = tfidf_vectorizer.transform([question])
-    sparse_scores = cosine_similarity(q_tfidf, tfidf_matrix).flatten()
-    top_sparse_indices = np.argsort(sparse_scores)[-TOP_K_RETRIEVAL:][::-1]
-    sparse_map = {idx: sparse_scores[idx] for idx in top_sparse_indices if sparse_scores[idx] > 0}
+    # 2. Sparse Search (BM25S)
+    sparse_map: Dict[int, float] = {}
+    if bm25_retriever is not None and bm25_corpus_ids:
+        query_tokens = bm25s.tokenize([question])
+        results, bm25_scores = bm25_retriever.retrieve(query_tokens, k=TOP_K_RETRIEVAL, corpus=bm25_corpus_ids)
+        if len(results) > 0:
+            retrieved_ids = results[0]
+            retrieved_scores = bm25_scores[0]
+            for cid, s in zip(retrieved_ids, retrieved_scores):
+                if isinstance(cid, (int, np.integer)) and 0 <= int(cid) < len(chunks_metadata):
+                    sparse_map[int(cid)] = float(s)
     
     # 3. Объединение кандидатов
     all_indices = set(dense_map.keys()) | set(sparse_map.keys())

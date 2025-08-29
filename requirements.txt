@@ -15,3 +15,7 @@ torchvision
 pillow
 docling
 langchain-docling
+bm25s[full]
+lingua-language-detector
+PyStemmer
+jax

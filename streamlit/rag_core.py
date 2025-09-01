@@ -34,7 +34,6 @@ embedder = None
 reranker = None
 faiss_index = None
 chunks_metadata = []
-translation_context_glossary = ""
 
 # BM25S глобальные объекты
 bm25_retriever = None
@@ -55,24 +54,6 @@ def initialize_models():
 def ensure_dir(path: str):
     Path(path).mkdir(parents=True, exist_ok=True)
 
-def extract_text_from_pdf_pages(pdf_path: str, num_pages: int = 5) -> str:
-    """
-    Извлекает приблизительно первые N страниц PDF, используя LangChain Docling loader.
-    Возвращает markdown-текст.
-    """
-    try:
-        loader = DoclingLoader(file_path=[pdf_path])
-        docs = loader.load()
-        if not docs:
-            return ""
-        full_text = "\n\n".join(d.page_content for d in docs if d.page_content and d.page_content.strip())
-        if not full_text:
-            return ""
-        blocks = full_text.split('\n\n')
-        selected = '\n\n'.join(blocks[:min(num_pages * 3, len(blocks))])
-        return selected.strip()
-    except Exception:
-        return ""
 # ---------------------------
 # PDF Loading & Text Extraction
 # ---------------------------
@@ -128,52 +109,17 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
     chunks = [c.strip() for c in chunks if len(c.strip()) > 20]
     return chunks
 
-def create_translation_glossary(pdf_dir: str, api_key: str) -> str:
-    """Создает краткий глоссарий терминов из первых страниц документов."""
-    initial_texts = []
-    pdf_files = glob.glob(os.path.join(pdf_dir, "*.pdf"))
-    for pdf_path in pdf_files[:3]: # Берем первые 3 документа для скорости
-        initial_texts.append(extract_text_from_pdf_pages(pdf_path, num_pages=5))
-    
-    full_initial_text = "\n\n".join(initial_texts)
-    
-    # Ограничиваем текст, чтобы не превысить лимиты LLM
-    truncated_text = full_initial_text[:8000] 
+ 
 
-    prompt = f"""
-    Analyze the following text from a document.
-    Identify and list the top 10-15 key technical terms, abbreviations, and concepts.
-    This list will be used as a glossary to help a translator accurately convert Russian questions into English search queries.
-    Return only the list of terms.
-
-    Text:
-    \"\"\"
-    {truncated_text}
-    \"\"\"
-
-    Key terms and glossary:
-    """
-
-    messages = [{"role": "system", "content": "You are a technical analyst."}, {"role": "user", "content": prompt}]
-    try:
-        response_json = call_openrouter_chat_completion(
-            api_key, OPENROUTER_MODEL, messages, extra_request_kwargs={"max_tokens": 500, "temperature": 0.2}
-        )
-        glossary = response_json.get("choices", [])[0].get("message", {}).get("content", "").strip()
-        return glossary
-    except Exception as e:
-        return ""
-
-def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, api_key: str, force_rebuild: bool = False):
+def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: bool = False):
     """Создает или загружает полную базу знаний, включая dense и sparse индексы."""
-    global faiss_index, chunks_metadata, translation_context_glossary, bm25_retriever, bm25_corpus_ids
+    global faiss_index, chunks_metadata, bm25_retriever, bm25_corpus_ids
     initialize_models()
 
     ensure_dir(index_dir)
     faiss_path = os.path.join(index_dir, "index.faiss")
     metadata_path = os.path.join(index_dir, "metadata.pkl")
     bm25_dir = os.path.join(index_dir, "bm25")
-    glossary_path = os.path.join(index_dir, "glossary.txt")
     bm25_ids_path = os.path.join(index_dir, "bm25_ids.pkl")
 
     if force_rebuild:
@@ -203,16 +149,11 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, api_key: str, fo
             bm25_loaded = bool(bm25_corpus_ids)
         except Exception:
             bm25_loaded = False
-        with open(glossary_path, "r", encoding="utf-8") as f: translation_context_glossary = f.read()
         if bm25_loaded:
             return True
 
     docs = load_pdfs_from_directory(pdf_dir)
     if not docs: raise RuntimeError(f"PDF-файлы не найдены в {pdf_dir}.")
-    
-    translation_context_glossary = create_translation_glossary(pdf_dir, api_key)
-    with open(glossary_path, "w", encoding="utf-8") as f:
-        f.write(translation_context_glossary)
 
     all_chunks_text, chunks_metadata = [], []
     doc_counter = 0
@@ -345,63 +286,28 @@ def create_rag_chain(openrouter_api_key: str, openrouter_model: str = OPENROUTER
     Создает RAG-цепочку, интегрируя перевод, гибридный поиск и переранжирование.
     """
     
-    translation_cache = {}
-
-    def translate_query_to_english(question: str) -> str:
-        global translation_context_glossary
-        if question in translation_cache: return translation_cache[question]
-        
-        try:
-            if sum(1 for char in question if 'а' <= char.lower() <= 'я') < len(question) / 4:
-                return question
-        except Exception: pass
-
-        # НОВОЕ: Улучшенный промпт с глоссарием
-        prompt = f"""
-        You are an expert technical translator. Your task is to translate a Russian user question into an English search query.
-        Use the provided glossary to ensure high accuracy of technical terms.
-
-        **Glossary of key terms:**
-        \"\"\"
-        {translation_context_glossary}
-        \"\"\"
-
-        **User question in Russian:** "{question}"
-
-        **Instructions:**
-        - Translate the Russian question into a clear English search query.
-        - Prioritize correct technical terminology based on the glossary.
-        - Return ONLY the translated text, without any explanations or quotation marks.
-
-        **English search query:**
-        """
-        messages = [{"role": "system", "content": "You are a helpful and expert technical translator."}, {"role": "user", "content": prompt}]
-        
+    def simple_query_translation(question: str) -> str:
+        """Простой перевод запроса на английский без доступа к корпусу."""
+        messages = [
+            {"role": "system", "content": "Translate this query to English. Do not add information."},
+            {"role": "user", "content": question},
+        ]
         try:
             response_json = call_openrouter_chat_completion(
-                api_key=openrouter_api_key, model=openrouter_model, messages=messages,
-                extra_request_kwargs={"max_tokens": 500, "temperature": 0.2}
+                api_key=openrouter_api_key,
+                model=openrouter_model,
+                messages=messages,
+                extra_request_kwargs={"temperature": 0.2},
             )
-            # --- УЛУЧШЕНИЕ: Более надежный парсинг ---
-            raw_translation = response_json.get("choices", [])[0].get("message", {}).get("content", "")
-            
-            # Сначала убираем возможные кавычки и пробелы
-            clean_translation = raw_translation.strip('" ')
-            
-            # Если после очистки что-то осталось, используем это
-            if clean_translation:
-                translation_cache[question] = clean_translation
-                return clean_translation
-            else:
-                # Если перевод пустой, возвращаем оригинальный вопрос и кэшируем его
-                translation_cache[question] = question
-                return question
-
-        except Exception as e:
+            text = response_json.get("choices", [])[0].get("message", {}).get("content", "").strip()
+            if not text:
+                text = response_json.get("choices", [])[0].get("text", "").strip()
+            return text or question
+        except Exception:
             return question
     
     def answer_question(question: str) -> tuple[str, str]:
-        english_question = translate_query_to_english(question)
+        english_question = simple_query_translation(question)
         retrieved = hybrid_search_with_rerank(english_question) # <-- Теперь это безопасно
         
         if not retrieved:

@@ -82,18 +82,16 @@ if process_button:
             with open(PDF_DIR / uploaded_file.name, "wb") as f:
                 f.write(uploaded_file.getbuffer())
         
-        with st.spinner("Создание базы знаний и контекстного глоссария... Это может занять время."):
+        with st.spinner("Создание базы знаний... Это может занять время."):
             try:
-                # НОВОЕ: передаем API ключ для создания глоссария
                 build_and_load_knowledge_base(
                     pdf_dir=PDF_DIR,
                     index_dir=VECTOR_STORE_PATH,
-                    api_key=st.session_state.openrouter_api_key,
                     force_rebuild=True
                 )
                 st.session_state.rag_chain = create_rag_chain(st.session_state.openrouter_api_key)
                 st.session_state.messages = []
-                st.success("База знаний и глоссарий успешно созданы!")
+                st.success("База знаний успешно создана!")
             except Exception as e:
                 st.error(f"Произошла ошибка при обработке документов: {e}")
                 if VECTOR_STORE_PATH.exists():
@@ -102,15 +100,13 @@ if process_button:
 # --- Загрузка базы знаний при первом запуске, если она уже есть ---
 if st.session_state.rag_chain is None and 'openrouter_api_key' in st.session_state:
     try:
-        # НОВОЕ: передаем API ключ
         if build_and_load_knowledge_base(
             pdf_dir=PDF_DIR,
             index_dir=VECTOR_STORE_PATH,
-            api_key=st.session_state.openrouter_api_key,
             force_rebuild=False
         ):
             st.session_state.rag_chain = create_rag_chain(st.session_state.openrouter_api_key)
-            st.toast("✅ Существующая база знаний и глоссарий загружены.", icon="📚")
+            st.toast("✅ Существующая база знаний загружена.", icon="📚")
     except Exception as e:
         st.warning(f"Не удалось загрузить базу знаний: {e}. Пожалуйста, обработайте файлы заново.")
 

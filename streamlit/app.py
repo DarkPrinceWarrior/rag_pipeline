@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import shutil
 # Импортируем обновленные функции
-from rag_core import build_and_load_knowledge_base, create_rag_chain, _load_api_key_from_env
+from rag_core import build_and_load_knowledge_base, create_rag_chain, _load_api_key_from_env, collect_candidates_ru_en
 
 # --- Конфигурация страницы ---
 st.set_page_config(
@@ -129,21 +129,44 @@ if prompt := st.chat_input("Ваш вопрос..."):
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            with st.spinner("Идет гибридный поиск и генерация ответа..."):
+            with st.spinner("Идет поиск кандидатов (RU/EN)..."):
                 try:
-                    rag_chain = st.session_state.rag_chain
-                    answer, context = rag_chain["answer_question"](prompt)
-                    
-                    response_placeholder = st.empty()
-                    response_placeholder.markdown(answer)
-                    
-                    with st.expander("Показать расширенный контекст, переданный в LLM"):
-                        st.text(context) # Теперь контекст содержит оценки релевантности!
-                    
+                    # Получаем кандидатов из четырех веток
+                    cands = collect_candidates_ru_en(prompt)
+
+                    # Краткая сводка по количеству
+                    summary_counts = {k: len(v) for k, v in cands.items()}
+                    st.markdown(f"**Сводка:** {summary_counts}")
+
+                    # Диагностика: показываем первые 10 кандидатов каждой ветки
+                    with st.expander("Диагностика ретрива: топ-10 кандидатов по каждой ветке"):
+                        for branch_key, branch_title in [
+                            ("dense_ru", "dense_ru"),
+                            ("bm25_ru", "bm25_ru"),
+                            ("dense_en", "dense_en"),
+                            ("bm25_en", "bm25_en"),
+                        ]:
+                            top_items = cands.get(branch_key, [])[:10]
+                            if not top_items:
+                                st.markdown(f"_{branch_title}: пусто_")
+                                continue
+                            rows = [
+                                {
+                                    "retrieval": it.get("retrieval"),
+                                    "rank": it.get("rank"),
+                                    "score_raw": it.get("score_raw"),
+                                    "source": it.get("source"),
+                                    "page": it.get("page"),
+                                }
+                                for it in top_items
+                            ]
+                            st.markdown(f"**{branch_title}**")
+                            st.dataframe(rows, use_container_width=True)
+
+                    # Сохраняем краткий ответ в историю чата (без реранка и генерации)
                     st.session_state.messages.append({
                         "role": "assistant",
-                        "content": answer,
-                        "context": context
+                        "content": f"Диагностика выполнена. Сводка: {summary_counts}",
                     })
                 except Exception as e:
-                    st.error(f"Произошла ошибка при получении ответа: {e}")
+                    st.error(f"Произошла ошибка при поиске кандидатов: {e}")

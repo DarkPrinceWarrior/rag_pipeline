@@ -29,6 +29,42 @@ TOP_K_FINAL = 5
 OPENROUTER_MODEL = "openai/gpt-oss-120b"
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 
+# Параметры веточного ретрива (RU/EN)
+TOP_K_DENSE_BRANCH = 100
+TOP_K_BM25_BRANCH = 100
+
+# Рантайм-параметры для перевода (устанавливаются при создании цепочки)
+runtime_openrouter_api_key: str | None = None
+runtime_openrouter_model: str | None = None
+
+# ---------------------------
+# Простой перевод RU → EN без доступа к корпусу
+# ---------------------------
+
+def simple_query_translation(question: str) -> str:
+    """Простой машинный перевод запроса на английский без обращения к корпусу."""
+    if not question or not question.strip():
+        return ""
+    if not runtime_openrouter_api_key or not runtime_openrouter_model:
+        return question
+    messages = [
+        {"role": "system", "content": "Translate this query to English. Do not add information."},
+        {"role": "user", "content": question},
+    ]
+    try:
+        response_json = call_openrouter_chat_completion(
+            api_key=runtime_openrouter_api_key,
+            model=runtime_openrouter_model,
+            messages=messages,
+            extra_request_kwargs={"temperature": 0.2},
+        )
+        text = response_json.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        if not text:
+            text = response_json.get("choices", [{}])[0].get("text", "").strip()
+        return text or question
+    except Exception:
+        return question
+
 # Глобальные переменные для хранения моделей и индексов
 embedder = None
 reranker = None
@@ -84,6 +120,153 @@ def build_candidates_from_arrays(indices: List[int], scores: List[float], retrie
             candidates.append(build_candidate_dict(int(idx), retrieval_label, current_rank, float(s)))
             current_rank += 1
     return candidates
+
+# ---------------------------
+# Двухветочный ретривал (RU и EN) с четырьмя списками кандидатов
+# ---------------------------
+
+def collect_candidates_ru_en(question: str, k_dense: int = TOP_K_DENSE_BRANCH, k_bm25: int = TOP_K_BM25_BRANCH) -> Dict[str, List[Dict[str, Any]]]:
+    """Возвращает 4 независимых списка кандидатов: dense_ru, bm25_ru, dense_en, bm25_en.
+
+    Формат каждого кандидата соответствует build_candidate_dict.
+    """
+    if not question or not question.strip():
+        return {"dense_ru": [], "bm25_ru": [], "dense_en": [], "bm25_en": []}
+
+    global faiss_index, chunks_metadata, embedder, bm25_retriever, bm25_corpus_ids
+
+    # RU: Dense
+    q_ru_emb = embedder.encode(
+        sentences=[question],
+        task="retrieval",
+        prompt_name="query",
+        normalize_embeddings=True,
+    ).astype("float32")
+    k_dense_eff = min(k_dense, faiss_index.ntotal if faiss_index is not None else 0)
+    dense_ru: List[Dict[str, Any]] = []
+    if k_dense_eff > 0:
+        ru_scores, ru_indices = faiss_index.search(q_ru_emb, k_dense_eff)
+        dense_ru = build_candidates_from_arrays(list(ru_indices[0]), list(ru_scores[0]), RETRIEVAL_DENSE_RU)
+
+    # RU: BM25S
+    bm25_ru: List[Dict[str, Any]] = []
+    if bm25_retriever is not None and bm25_corpus_ids:
+        ru_query_tokens = bm25s.tokenize([question])
+        ru_results, ru_bm25_scores = bm25_retriever.retrieve(ru_query_tokens, k=k_bm25, corpus=bm25_corpus_ids)
+        if len(ru_results) > 0:
+            bm25_ru = build_candidates_from_arrays(list(ru_results[0]), list(ru_bm25_scores[0]), RETRIEVAL_BM25_RU)
+
+    # EN translation
+    en_question = simple_query_translation(question)
+
+    # EN: Dense
+    q_en_emb = embedder.encode(
+        sentences=[en_question],
+        task="retrieval",
+        prompt_name="query",
+        normalize_embeddings=True,
+    ).astype("float32")
+    dense_en: List[Dict[str, Any]] = []
+    if k_dense_eff > 0:
+        en_scores, en_indices = faiss_index.search(q_en_emb, k_dense_eff)
+        dense_en = build_candidates_from_arrays(list(en_indices[0]), list(en_scores[0]), RETRIEVAL_DENSE_EN)
+
+    # EN: BM25S
+    bm25_en: List[Dict[str, Any]] = []
+    if bm25_retriever is not None and bm25_corpus_ids:
+        en_query_tokens = bm25s.tokenize([en_question])
+        en_results, en_bm25_scores = bm25_retriever.retrieve(en_query_tokens, k=k_bm25, corpus=bm25_corpus_ids)
+        if len(en_results) > 0:
+            bm25_en = build_candidates_from_arrays(list(en_results[0]), list(en_bm25_scores[0]), RETRIEVAL_BM25_EN)
+
+    result = {
+        "dense_ru": dense_ru,
+        "bm25_ru": bm25_ru,
+        "dense_en": dense_en,
+        "bm25_en": bm25_en,
+    }
+    # Мягкая дедупликация: только логирование пересечений
+    log_intersections_debug(result)
+    return result
+
+def _compute_intersections_report(cands: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """Вычисляет пересечения по chunk_id между всеми парами списков и готовит debug-отчет.
+
+    Возвращает словарь с метриками по парам и примерами дубликатов.
+    """
+    branches = [RETRIEVAL_DENSE_RU, RETRIEVAL_BM25_RU, RETRIEVAL_DENSE_EN, RETRIEVAL_BM25_EN]
+    name_to_list = {
+        RETRIEVAL_DENSE_RU: cands.get("dense_ru", []),
+        RETRIEVAL_BM25_RU: cands.get("bm25_ru", []),
+        RETRIEVAL_DENSE_EN: cands.get("dense_en", []),
+        RETRIEVAL_BM25_EN: cands.get("bm25_en", []),
+    }
+    name_to_idset = {name: {c.get("chunk_id") for c in lst} for name, lst in name_to_list.items()}
+    name_to_idmap = {name: {c.get("chunk_id"): c for c in lst} for name, lst in name_to_list.items()}
+
+    pair_stats: List[Dict[str, Any]] = []
+    for i in range(len(branches)):
+        for j in range(i + 1, len(branches)):
+            a = branches[i]
+            b = branches[j]
+            set_a = name_to_idset[a]
+            set_b = name_to_idset[b]
+            inter = list(set_a & set_b)
+            size_a = len(set_a)
+            size_b = len(set_b)
+            union = len(set_a | set_b)
+            share_min = (len(inter) / max(1, min(size_a, size_b))) if (size_a > 0 and size_b > 0) else 0.0
+            share_union = (len(inter) / max(1, union))
+            # Примеры дубликатов (до 5 штук)
+            examples = []
+            for cid in inter[:5]:
+                ca = name_to_idmap[a].get(cid)
+                cb = name_to_idmap[b].get(cid)
+                if ca and cb:
+                    examples.append({
+                        "chunk_id": cid,
+                        "a": {"retrieval": ca.get("retrieval"), "rank": ca.get("rank"), "score_raw": ca.get("score_raw")},
+                        "b": {"retrieval": cb.get("retrieval"), "rank": cb.get("rank"), "score_raw": cb.get("score_raw")},
+                    })
+            pair_stats.append({
+                "pair": [a, b],
+                "intersection": len(inter),
+                "size_a": size_a,
+                "size_b": size_b,
+                "share_min": share_min,
+                "share_union": share_union,
+                "examples": examples,
+            })
+
+    return {"pairs": pair_stats}
+
+def log_intersections_debug(cands: Dict[str, List[Dict[str, Any]]]) -> None:
+    """Опционально выводит debug-отчет о пересечениях кандидатов при RAG_DEBUG=1.
+
+    Никаких побочных эффектов, если переменная окружения не установлена.
+    """
+    if os.getenv("RAG_DEBUG") != "1":
+        return
+    report = _compute_intersections_report(cands)
+    try:
+        import logging
+        logger = logging.getLogger(__name__)
+        for p in report.get("pairs", []):
+            logger.debug(
+                "[DEDUP] pair=%s vs %s | inter=%d | size_a=%d | size_b=%d | share_min=%.3f | share_union=%.3f",
+                p.get("pair", [None, None])[0], p.get("pair", [None, None])[1], p.get("intersection", 0),
+                p.get("size_a", 0), p.get("size_b", 0), p.get("share_min", 0.0), p.get("share_union", 0.0)
+            )
+            for ex in p.get("examples", []):
+                logger.debug(
+                    "[DEDUP_EX] chunk_id=%s | A(retr=%s,rank=%s,score=%.6f) | B(retr=%s,rank=%s,score=%.6f)",
+                    str(ex.get("chunk_id")),
+                    ex.get("a", {}).get("retrieval"), ex.get("a", {}).get("rank"), float(ex.get("a", {}).get("score_raw", 0.0)),
+                    ex.get("b", {}).get("retrieval"), ex.get("b", {}).get("rank"), float(ex.get("b", {}).get("score_raw", 0.0)),
+                )
+    except Exception:
+        # Безопасный no-op в случае проблем с логгером
+        pass
 
 def initialize_models():
     """Инициализирует и кэширует модели в глобальных переменных."""
@@ -274,57 +457,11 @@ def call_openrouter_chat_completion(api_key, model, messages, endpoint=OPENROUTE
 # ---------------------------
 
 # Новая функция гибридного поиска, которая будет вызываться из answer_question
-def hybrid_search_with_rerank(question: str) -> List[Dict[str, Any]]:
-    
-    # --- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Защита от пустого запроса ---
+def hybrid_search_with_rerank(question: str) -> Dict[str, List[Dict[str, Any]]]:
+    """На этом шаге просто проксирует к collect_candidates_ru_en без реранка и фьюжна."""
     if not question or not question.strip():
-        return []
-
-    global faiss_index, chunks_metadata, embedder, reranker, bm25_retriever, bm25_corpus_ids
-
-    # 1. Dense Search
-    # ИЗМЕНЕНО: Используем Jina v4 с task="retrieval" и prompt_name="query" для запросов
-    q_emb = embedder.encode(
-        sentences=[question], 
-        task="retrieval", 
-        prompt_name="query", 
-        normalize_embeddings=True
-    ).astype("float32")
-    scores, indices = faiss_index.search(q_emb, TOP_K_RETRIEVAL)
-    dense_map = {idx: score for idx, score in zip(indices[0], scores[0]) if idx != -1}
-
-    # 2. Sparse Search (BM25S)
-    sparse_map: Dict[int, float] = {}
-    if bm25_retriever is not None and bm25_corpus_ids:
-        query_tokens = bm25s.tokenize([question])
-        results, bm25_scores = bm25_retriever.retrieve(query_tokens, k=TOP_K_RETRIEVAL, corpus=bm25_corpus_ids)
-        if len(results) > 0:
-            retrieved_ids = results[0]
-            retrieved_scores = bm25_scores[0]
-            for cid, s in zip(retrieved_ids, retrieved_scores):
-                if isinstance(cid, (int, np.integer)) and 0 <= int(cid) < len(chunks_metadata):
-                    sparse_map[int(cid)] = float(s)
-    
-    # 3. Объединение кандидатов
-    all_indices = set(dense_map.keys()) | set(sparse_map.keys())
-    candidates = []
-    for idx in all_indices:
-        if idx < len(chunks_metadata):
-            candidate = chunks_metadata[idx].copy()
-            candidate['dense_score'] = dense_map.get(idx, 0.0)
-            candidate['sparse_score'] = sparse_map.get(idx, 0.0)
-            candidates.append(candidate)
-
-    if not candidates: return []
-
-    # 4. Переранжирование (Reranking)
-    pairs = [(question, cand['text']) for cand in candidates]
-    rerank_scores = reranker.predict(pairs, show_progress_bar=False)
-    for cand, score in zip(candidates, rerank_scores):
-        cand['final_score'] = float(score)
-
-    candidates.sort(key=lambda x: x['final_score'], reverse=True)
-    return candidates[:TOP_K_FINAL]
+        return {"dense_ru": [], "bm25_ru": [], "dense_en": [], "bm25_en": []}
+    return collect_candidates_ru_en(question)
 
 # --- ГЛАВНАЯ ОБНОВЛЕННАЯ ФУНКЦИЯ ---
 def create_rag_chain(openrouter_api_key: str, openrouter_model: str = OPENROUTER_MODEL):
@@ -332,115 +469,17 @@ def create_rag_chain(openrouter_api_key: str, openrouter_model: str = OPENROUTER
     Создает RAG-цепочку, интегрируя перевод, гибридный поиск и переранжирование.
     """
     
-    def simple_query_translation(question: str) -> str:
-        """Простой перевод запроса на английский без доступа к корпусу."""
-        messages = [
-            {"role": "system", "content": "Translate this query to English. Do not add information."},
-            {"role": "user", "content": question},
-        ]
-        try:
-            response_json = call_openrouter_chat_completion(
-                api_key=openrouter_api_key,
-                model=openrouter_model,
-                messages=messages,
-                extra_request_kwargs={"temperature": 0.2},
-            )
-            text = response_json.get("choices", [])[0].get("message", {}).get("content", "").strip()
-            if not text:
-                text = response_json.get("choices", [])[0].get("text", "").strip()
-            return text or question
-        except Exception:
-            return question
+    # Прокидываем рантайм-параметры для simple_query_translation
+    global runtime_openrouter_api_key, runtime_openrouter_model
+    runtime_openrouter_api_key = openrouter_api_key
+    runtime_openrouter_model = openrouter_model
     
     def answer_question(question: str) -> tuple[str, str]:
-        english_question = simple_query_translation(question)
-        retrieved = hybrid_search_with_rerank(english_question) # <-- Теперь это безопасно
-        
-        if not retrieved:
-            return "На основе предоставленных документов я не могу найти ответ на этот вопрос.", "Контекст не был найден в базе знаний."
-
-        # --- ШАГ 3: СБОРКА КОНТЕКСТА (с новой информацией) ---
-        context_pieces = []
-        for r in retrieved:
-            piece = (f"---\nИсточник: {r.get('source','unknown')} [чанк {r.get('chunk_index')}]\n"
-                     f"Оценка релевантности (Reranker): {r.get('final_score'):.4f}\n"
-                     f"Текст:\n{r.get('text')}\n")
-            context_pieces.append(piece)
-        context = "\n\n".join(context_pieces)
-
-        
-        # Заранее определяем шаблон нашего профессионального промпта
-        PROFESSIONAL_PROMPT_TEMPLATE = """
-        <System_Role>
-        Ты — AI-ассистент, специализирующийся на высокоточном извлечении ответов из текста (Question Answering). Твоя задача — отвечать на вопросы, основываясь исключительно на предоставленном ограниченном контексте.
-        </System_Role>
-
-        <Task>
-        <Objective>
-            Сформулировать краткий и точный ответ на `<Input_Query>`, используя только информацию из `<Knowledge_Capsule>`. Ответ должен быть на русском языке и включать ссылки на источники в заданном формате.
-        </Objective>
-
-        <Knowledge_Capsule id="CONTEXT_FOR_ANSWER">
-            <Header>
-            Этот блок содержит единственный источник правдивой информации для твоего ответа. Любые знания, выходящие за рамки этого контекста, должны быть полностью проигнорированы.
-            </Header>
-            <Corpus name="Контекст">
-            {context}
-            </Corpus>
-            <Footer>
-            Конец контекста.
-            </Footer>
-        </Knowledge_Capsule>
-
-        <Input_Query name="Вопрос">
-            {question}
-        </Input_Query>
-
-        <Output_Specification>
-            <Audience>Конечный пользователь.</Audience>
-            <Language>Русский.</Language>
-            <Style>Краткий, лаконичный, по существу, не более двух абзацев.</Style>
-            <Rules>
-            <Rule priority="critical">
-                Ответ должен быть сформирован СТРОГО на основе информации из блока `<Corpus>`.
-            </Rule>
-            <Rule priority="critical">
-                ЗАПРЕЩЕНО использовать любые внешние знания, личный опыт или делать предположения, не подтвержденные текстом.
-            </Rule>
-            <Rule name="Fallback_Response">
-                Если ответ на `<Input_Query>` не может быть найден в `<Corpus>`, твой ответ должен состоять ИСКЛЮЧИТЕЛЬНО из фразы: "Я не знаю на основании предоставленных документов."
-            </Rule>
-            <Rule name="Citation_Format">
-                При цитировании информации обязательно указывай источник в формате `[имя_файла:chunk_index]`. Ссылка должна стоять в том же предложении, где используется информация из этого источника.
-            </Rule>
-            </Rules>
-        </Output_Specification>
-
-        <Final_Query>
-            Проанализируй `<Input_Query>` и `<Knowledge_Capsule>`, после чего сгенерируй ответ, строго следуя всем правилам и форматам, указанным в `<Output_Specification>`.
-        </Final_Query>
-        </Task>
-        ...
-        """
-
-        # В функции answer_question форматируем его с реальными данными
-        final_prompt = PROFESSIONAL_PROMPT_TEMPLATE.format(context=context, question=question)
-
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": final_prompt}
-        ]
-        
-        response_json = call_openrouter_chat_completion(
-            api_key=openrouter_api_key, model=openrouter_model, messages=messages
-        )
-        try:
-            reply = response_json.get("choices", [])[0].get("message", {}).get("content", "").strip()
-            if not reply:
-                reply = response_json.get("choices", [])[0].get("text", "")
-            return reply.strip(), context
-        except Exception as e:
-            raise RuntimeError(f"Failed to parse OpenRouter response: {e}. Full response: {json.dumps(response_json)}")
+        # На этом шаге возвращаем только списки кандидатов в 4 ветках
+        cands = hybrid_search_with_rerank(question)
+        # Возвращаем текстовую сводку для UI (минимально)
+        summary = json.dumps({k: len(v) for k, v in cands.items()}, ensure_ascii=False)
+        return summary, ""
 
     return { "answer_question": answer_question }
 

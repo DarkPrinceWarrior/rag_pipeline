@@ -39,6 +39,52 @@ chunks_metadata = []
 bm25_retriever = None
 bm25_corpus_ids: List[int] = []
 
+# ---------------------------
+# Единый формат кандидата для ретрива
+# ---------------------------
+
+# Метки веток ретрива (используются для журналирования и последующего RRF)
+RETRIEVAL_DENSE_RU = "dense_ru"
+RETRIEVAL_BM25_RU = "bm25_ru"
+RETRIEVAL_DENSE_EN = "dense_en"
+RETRIEVAL_BM25_EN = "bm25_en"
+
+def build_candidate_dict(chunk_global_id: int, retrieval_label: str, rank: int, score_raw: float) -> Dict[str, Any]:
+    """Создает единый словарь для кандидата документа.
+
+    Параметры:
+    - chunk_global_id: глобальный индекс чанка в списке chunks_metadata
+    - retrieval_label: одна из меток {dense_ru,bm25_ru,dense_en,bm25_en}
+    - rank: позиция кандидата в своем списке (начиная с 1)
+    - score_raw: сырой скор соответствующего ретривера (без нормализации)
+    """
+    if not isinstance(chunk_global_id, (int, np.integer)) or chunk_global_id < 0 or chunk_global_id >= len(chunks_metadata):
+        raise ValueError("Некорректный chunk_global_id для кандидата.")
+    meta = chunks_metadata[chunk_global_id]
+    return {
+        "chunk_id": int(chunk_global_id),
+        "source": meta.get("source"),
+        "chunk_index": meta.get("chunk_index"),
+        "page": meta.get("page") if isinstance(meta, dict) and "page" in meta else None,
+        "text_ref": meta.get("text"),
+        "retrieval": retrieval_label,
+        "rank": int(rank),
+        "score_raw": float(score_raw),
+    }
+
+def build_candidates_from_arrays(indices: List[int], scores: List[float], retrieval_label: str) -> List[Dict[str, Any]]:
+    """Создает список кандидатов в едином формате по массивам индексов и скоров.
+
+    Возвращает список, отсортированный по исходному порядку (рангам) без нормализации.
+    """
+    candidates: List[Dict[str, Any]] = []
+    current_rank = 1
+    for idx, s in zip(indices, scores):
+        if isinstance(idx, (int, np.integer)) and 0 <= int(idx) < len(chunks_metadata):
+            candidates.append(build_candidate_dict(int(idx), retrieval_label, current_rank, float(s)))
+            current_rank += 1
+    return candidates
+
 def initialize_models():
     """Инициализирует и кэширует модели в глобальных переменных."""
     global embedder, reranker

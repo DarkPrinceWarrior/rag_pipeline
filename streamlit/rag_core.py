@@ -174,6 +174,7 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, api_key: str, fo
     metadata_path = os.path.join(index_dir, "metadata.pkl")
     bm25_dir = os.path.join(index_dir, "bm25")
     glossary_path = os.path.join(index_dir, "glossary.txt")
+    bm25_ids_path = os.path.join(index_dir, "bm25_ids.pkl")
 
     if force_rebuild:
         for path in [faiss_path, metadata_path]:
@@ -184,6 +185,8 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, api_key: str, fo
                 for name in files:
                     os.remove(os.path.join(root, name))
             os.rmdir(bm25_dir)
+        if os.path.exists(bm25_ids_path):
+            os.remove(bm25_ids_path)
 
     bm25_loaded = False
     if os.path.exists(faiss_path) and os.path.exists(metadata_path) and os.path.isdir(bm25_dir):
@@ -191,10 +194,13 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, api_key: str, fo
         with open(metadata_path, "rb") as f: chunks_metadata = pickle.load(f)
         # Загрузка BM25 индекса и ID корпуса
         try:
-            bm25_retriever = bm25s.BM25.load(bm25_dir, load_corpus=True, mmap=True)
-            # BM25S сохраняет корпус; мы ожидаем, что там лежат chunk_id
-            bm25_corpus_ids = list(bm25_retriever.corpus) if hasattr(bm25_retriever, "corpus") else []
-            bm25_loaded = True
+            bm25_retriever = bm25s.BM25.load(bm25_dir, load_corpus=False, mmap=False)
+            if os.path.exists(bm25_ids_path):
+                with open(bm25_ids_path, "rb") as f:
+                    bm25_corpus_ids = pickle.load(f)
+            else:
+                bm25_corpus_ids = []
+            bm25_loaded = bool(bm25_corpus_ids)
         except Exception:
             bm25_loaded = False
         with open(glossary_path, "r", encoding="utf-8") as f: translation_context_glossary = f.read()
@@ -238,12 +244,24 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, api_key: str, fo
     faiss.write_index(faiss_index, faiss_path)
 
     # Построение BM25S sparse-индекса
-    bm25_corpus_ids = list(range(len(all_chunks_text)))
-    corpus_tokens = bm25s.tokenize(all_chunks_text)
+    texts_for_bm25 = []
+    bm25_corpus_ids = []
+    for idx, meta in enumerate(chunks_metadata):
+        t = meta.get("text")
+        if isinstance(t, str):
+            s = t.strip()
+            if s:
+                texts_for_bm25.append(s)
+                bm25_corpus_ids.append(idx)
+    if not texts_for_bm25:
+        raise RuntimeError("BM25 корпус пуст после фильтрации.")
+    corpus_tokens = bm25s.tokenize(texts_for_bm25)
     bm25_retriever = bm25s.BM25(method="lucene")
     bm25_retriever.index(corpus_tokens)
     ensure_dir(bm25_dir)
-    bm25_retriever.save(bm25_dir, corpus=bm25_corpus_ids)
+    bm25_retriever.save(bm25_dir)
+    with open(bm25_ids_path, "wb") as f:
+        pickle.dump(bm25_corpus_ids, f)
 
     with open(metadata_path, "wb") as f: pickle.dump(chunks_metadata, f)
     return True
@@ -485,5 +503,4 @@ def _load_api_key_from_env() -> str:
     if not key:
         raise RuntimeError("OPENROUTER_API_KEY не найден в .env файле.")
     return key
-
 

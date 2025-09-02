@@ -18,4 +18,6 @@ langchain-docling
 bm25s[full]
 lingua-language-detector
 PyStemmer
-jax
+jax[cuda12]
+FlagEmbedding
+accelerate

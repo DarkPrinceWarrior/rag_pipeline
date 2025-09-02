@@ -664,4 +664,3 @@ def _load_api_key_from_env() -> str:
     if not key:
         raise RuntimeError("OPENROUTER_API_KEY не найден в .env файле.")
     return key
-

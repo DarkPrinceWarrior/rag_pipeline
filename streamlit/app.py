@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import shutil
 # Импортируем обновленные функции
-from rag_core import build_and_load_knowledge_base, create_rag_chain, _load_api_key_from_env, collect_candidates_ru_en
+from rag_core import build_and_load_knowledge_base, create_rag_chain, _load_api_key_from_env, hybrid_search_with_rerank
 
 # --- Конфигурация страницы ---
 st.set_page_config(
@@ -129,44 +129,45 @@ if prompt := st.chat_input("Ваш вопрос..."):
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            with st.spinner("Идет поиск кандидатов (RU/EN)..."):
+            with st.spinner("Идет гибридный поиск, RRF и реранк..."):
                 try:
-                    # Получаем кандидатов из четырех веток
-                    cands = collect_candidates_ru_en(prompt)
+                    result = hybrid_search_with_rerank(prompt)
+                    fused = result.get("fused", [])
+                    reranked = result.get("reranked", [])
 
-                    # Краткая сводка по количеству
-                    summary_counts = {k: len(v) for k, v in cands.items()}
-                    st.markdown(f"**Сводка:** {summary_counts}")
+                    # Краткая сводка
+                    st.markdown(f"**Сводка:** {{'fused': {len(fused)}, 'reranked': {len(reranked)}}}")
 
-                    # Диагностика: показываем первые 10 кандидатов каждой ветки
-                    with st.expander("Диагностика ретрива: топ-10 кандидатов по каждой ветке"):
-                        for branch_key, branch_title in [
-                            ("dense_ru", "dense_ru"),
-                            ("bm25_ru", "bm25_ru"),
-                            ("dense_en", "dense_en"),
-                            ("bm25_en", "bm25_en"),
-                        ]:
-                            top_items = cands.get(branch_key, [])[:10]
-                            if not top_items:
-                                st.markdown(f"_{branch_title}: пусто_")
-                                continue
-                            rows = [
-                                {
-                                    "retrieval": it.get("retrieval"),
-                                    "rank": it.get("rank"),
-                                    "score_raw": it.get("score_raw"),
-                                    "source": it.get("source"),
-                                    "page": it.get("page"),
-                                }
-                                for it in top_items
-                            ]
-                            st.markdown(f"**{branch_title}**")
-                            st.dataframe(rows, use_container_width=True)
+                    # Блок RRF-слияние (top-20)
+                    with st.expander("RRF-слияние (top-20)"):
+                        rows_fused = [
+                            {
+                                "fusion_score": it.get("fusion_score"),
+                                "min_rank": it.get("min_rank"),
+                                "hits": it.get("hits"),
+                                "source": it.get("source"),
+                                "page": it.get("page"),
+                            }
+                            for it in fused[:20]
+                        ]
+                        st.dataframe(rows_fused, use_container_width=True)
 
-                    # Сохраняем краткий ответ в историю чата (без реранка и генерации)
+                    # Блок Результаты реранка (top-5)
+                    with st.expander("Результаты реранка (top-5)"):
+                        rows_rerank = [
+                            {
+                                "rerank_score": it.get("rerank_score"),
+                                "source": it.get("source"),
+                                "page": it.get("page"),
+                                "retrieval_hits": it.get("hits"),
+                            }
+                            for it in reranked[:5]
+                        ]
+                        st.dataframe(rows_rerank, use_container_width=True)
+
                     st.session_state.messages.append({
                         "role": "assistant",
-                        "content": f"Диагностика выполнена. Сводка: {summary_counts}",
+                        "content": f"Сводка: {{'fused': {len(fused)}, 'reranked': {len(reranked)}}}",
                     })
                 except Exception as e:
-                    st.error(f"Произошла ошибка при поиске кандидатов: {e}")
+                    st.error(f"Произошла ошибка при поиске/слиянии/реранке: {e}")

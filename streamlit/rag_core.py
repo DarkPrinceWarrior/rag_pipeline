@@ -33,6 +33,15 @@ OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 TOP_K_DENSE_BRANCH = 100
 TOP_K_BM25_BRANCH = 100
 
+# Параметры RRF и входа в реранкер
+RRF_K = 60
+TOP_K_RERANK_INPUT = 150
+RRF_WEIGHT_DENSE = 1.0
+RRF_WEIGHT_BM25 = 1.0
+
+# Ограничение длины текста кандидата для реранка (примерно 350–400 токенов)
+RERANK_MAX_TOKENS = 380
+
 # Рантайм-параметры для перевода (устанавливаются при создании цепочки)
 runtime_openrouter_api_key: str | None = None
 runtime_openrouter_model: str | None = None
@@ -268,6 +277,106 @@ def log_intersections_debug(cands: Dict[str, List[Dict[str, Any]]]) -> None:
         # Безопасный no-op в случае проблем с логгером
         pass
 
+# ---------------------------
+# RRF-слияние четырех списков кандидатов
+# ---------------------------
+
+def fuse_candidates_rrf(cands_by_branch: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Выполняет Reciprocal Rank Fusion над четырьмя ветками результатов.
+
+    Используется классическая формула RRF по рангам: score = weight / (RRF_K + rank).
+    Дубликаты по chunk_id объединяются: суммируется score, сохраняется минимальный ранг,
+    список веток (hits) и один экземпляр метаданных (source, page, text_ref и др.).
+    Итог сортируется по fusion_score (desc), затем по min_rank (asc), затем по приоритету веток.
+    """
+    if not cands_by_branch:
+        return []
+
+    branch_priority = ["dense_ru", "bm25_ru", "dense_en", "bm25_en"]
+    def weight_for_branch(branch_key: str) -> float:
+        return RRF_WEIGHT_DENSE if branch_key in ("dense_ru", "dense_en") else RRF_WEIGHT_BM25
+
+    aggregated: Dict[int, Dict[str, Any]] = {}
+
+    for branch in branch_priority:
+        items = cands_by_branch.get(branch, []) or []
+        w = weight_for_branch(branch)
+        for item in items:
+            chunk_id = item.get("chunk_id")
+            rank = item.get("rank")
+            if not isinstance(chunk_id, (int, np.integer)):
+                continue
+            if not isinstance(rank, (int, np.integer)) or int(rank) <= 0:
+                continue
+            rank_int = int(rank)
+            score = float(w) / float(RRF_K + rank_int)
+            if chunk_id not in aggregated:
+                aggregated[chunk_id] = {
+                    "chunk_id": int(chunk_id),
+                    "source": item.get("source"),
+                    "chunk_index": item.get("chunk_index"),
+                    "page": item.get("page"),
+                    "text_ref": item.get("text_ref"),
+                    "fusion_score": score,
+                    "min_rank": rank_int,
+                    "hits": [branch],
+                }
+            else:
+                agg = aggregated[chunk_id]
+                agg["fusion_score"] = float(agg.get("fusion_score", 0.0)) + score
+                agg["min_rank"] = min(int(agg.get("min_rank", rank_int)), rank_int)
+                if branch not in agg.get("hits", []):
+                    agg["hits"].append(branch)
+
+    def branch_priority_index(hits: List[str]) -> int:
+        for idx, b in enumerate(branch_priority):
+            if b in hits:
+                return idx
+        return len(branch_priority)
+
+    fused = list(aggregated.values())
+    fused.sort(key=lambda x: (
+        -float(x.get("fusion_score", 0.0)),
+        int(x.get("min_rank", 10**9)),
+        branch_priority_index(x.get("hits", [])),
+    ))
+    return fused[:TOP_K_RERANK_INPUT]
+
+# ---------------------------
+# Препроцессор текста для реранка
+# ---------------------------
+
+def truncate_candidates_for_rerank(candidates: List[Dict[str, Any]], max_tokens: int = RERANK_MAX_TOKENS) -> List[Dict[str, Any]]:
+    """Усекает candidate['text_ref'] до безопасного окна по количеству токенов.
+
+    Токены считаем по пробельному разделению. Возвращает новый список кандидатов
+    (копии словарей при усечении), не изменяя исходные объекты.
+    """
+    if not candidates:
+        return []
+    truncated = 0
+    processed: List[Dict[str, Any]] = []
+    for cand in candidates:
+        text = cand.get("text_ref")
+        if isinstance(text, str):
+            tokens = text.split()
+            if len(tokens) > max_tokens:
+                new_cand = cand.copy()
+                new_cand["text_ref"] = " ".join(tokens[:max_tokens])
+                processed.append(new_cand)
+                truncated += 1
+            else:
+                processed.append(cand)
+        else:
+            processed.append(cand)
+    if os.getenv("RAG_DEBUG") == "1":
+        try:
+            import logging
+            logging.getLogger(__name__).debug("[RERANK_TRUNCATE] truncated=%d of %d", truncated, len(candidates))
+        except Exception:
+            pass
+    return processed
+
 def initialize_models():
     """Инициализирует и кэширует модели в глобальных переменных."""
     global embedder, reranker
@@ -366,6 +475,12 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
     bm25_loaded = False
     if os.path.exists(faiss_path) and os.path.exists(metadata_path) and os.path.isdir(bm25_dir):
         faiss_index = faiss.read_index(faiss_path)
+        # Обновляем параметр поиска HNSW после загрузки индекса
+        try:
+            if hasattr(faiss_index, "hnsw"):
+                faiss_index.hnsw.efSearch = 128
+        except Exception:
+            pass
         with open(metadata_path, "rb") as f: chunks_metadata = pickle.load(f)
         # Загрузка BM25 индекса и ID корпуса
         try:
@@ -458,10 +573,43 @@ def call_openrouter_chat_completion(api_key, model, messages, endpoint=OPENROUTE
 
 # Новая функция гибридного поиска, которая будет вызываться из answer_question
 def hybrid_search_with_rerank(question: str) -> Dict[str, List[Dict[str, Any]]]:
-    """На этом шаге просто проксирует к collect_candidates_ru_en без реранка и фьюжна."""
+    """Гибридный поиск с RRF-слиянием и реранком.
+
+    Возвращает структуру вида {"fused": fused_top[:20], "reranked": reranked_top}.
+    """
     if not question or not question.strip():
-        return {"dense_ru": [], "bm25_ru": [], "dense_en": [], "bm25_en": []}
-    return collect_candidates_ru_en(question)
+        return {"fused": [], "reranked": []}
+
+    # Сбор кандидатов по четырем веткам
+    cands_by_branch = collect_candidates_ru_en(question)
+
+    # RRF-слияние
+    fused_top = fuse_candidates_rrf(cands_by_branch)
+    if not fused_top:
+        return {"fused": [], "reranked": []}
+
+    # Подготовка текста для реранка
+    fused_for_rerank = truncate_candidates_for_rerank(fused_top)
+
+    # Пары (вопрос, текст)
+    pairs = [(question, c.get("text_ref", "") or "") for c in fused_for_rerank]
+
+    # Гарантируем инициализацию модели реранка
+    global reranker
+    if reranker is None:
+        initialize_models()
+
+    scores = reranker.predict(pairs, show_progress_bar=False)
+    reranked = []
+    for cand, scr in zip(fused_for_rerank, scores):
+        item = cand.copy()
+        item["rerank_score"] = float(scr)
+        reranked.append(item)
+
+    reranked.sort(key=lambda x: x.get("rerank_score", 0.0), reverse=True)
+    reranked_top = reranked[:TOP_K_FINAL]
+
+    return {"fused": fused_top[:20], "reranked": reranked_top}
 
 # --- ГЛАВНАЯ ОБНОВЛЕННАЯ ФУНКЦИЯ ---
 def create_rag_chain(openrouter_api_key: str, openrouter_model: str = OPENROUTER_MODEL):
@@ -475,11 +623,18 @@ def create_rag_chain(openrouter_api_key: str, openrouter_model: str = OPENROUTER
     runtime_openrouter_model = openrouter_model
     
     def answer_question(question: str) -> tuple[str, str]:
-        # На этом шаге возвращаем только списки кандидатов в 4 ветках
-        cands = hybrid_search_with_rerank(question)
-        # Возвращаем текстовую сводку для UI (минимально)
-        summary = json.dumps({k: len(v) for k, v in cands.items()}, ensure_ascii=False)
-        return summary, ""
+        # Считаем кандидатов по веткам для статистики
+        branch_cands = collect_candidates_ru_en(question)
+        # Выполняем гибридный поиск с RRF и реранком
+        hybrid_out = hybrid_search_with_rerank(question)
+        stats = {
+            "branch_counts": {k: len(v) for k, v in branch_cands.items()},
+            "fused_size": len(hybrid_out.get("fused", [])),
+            "reranked_size": len(hybrid_out.get("reranked", [])),
+        }
+        stats_str = json.dumps(stats, ensure_ascii=False)
+        # Пустой ответ LLM на этом шаге; генерация будет добавлена позже
+        return "", stats_str
 
     return { "answer_question": answer_question }
 

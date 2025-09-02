@@ -10,7 +10,8 @@ from typing import List, Dict, Any
 import numpy as np
 from dotenv import load_dotenv
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from sentence_transformers import SentenceTransformer
+from FlagEmbedding import FlagReranker
 from langchain_docling import DoclingLoader
 import bm25s
 
@@ -21,7 +22,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 PDF_DIR = str(BASE_DIR / "pdfs")
 VECTOR_STORE_PATH = str(BASE_DIR / "faiss_index")  # directory where index and metadata are stored
 EMBEDDING_MODEL_NAME = "jinaai/jina-embeddings-v4"  # <-- ИЗМЕНЕНО: Замена на Jina v4
-RERANKER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 TOP_K_RETRIEVAL = 15
@@ -41,6 +42,8 @@ RRF_WEIGHT_BM25 = 1.0
 
 # Ограничение длины текста кандидата для реранка (примерно 350–400 токенов)
 RERANK_MAX_TOKENS = 380
+RERANK_MAX_LENGTH = 512
+RERANK_BATCH_SIZE = 32
 
 # Рантайм-параметры для перевода (устанавливаются при создании цепочки)
 runtime_openrouter_api_key: str | None = None
@@ -383,7 +386,14 @@ def initialize_models():
     if embedder is None:
         embedder = SentenceTransformer(EMBEDDING_MODEL_NAME, trust_remote_code=True)
     if reranker is None:
-        reranker = CrossEncoder(RERANKER_MODEL_NAME)
+        # Мульти-язычный реранкер BGE v2 m3
+        use_fp16 = False
+        try:
+            import torch  # type: ignore
+            use_fp16 = bool(getattr(torch.cuda, "is_available", lambda: False)())
+        except Exception:
+            use_fp16 = False
+        reranker = FlagReranker(RERANKER_MODEL_NAME, use_fp16=use_fp16, max_length=RERANK_MAX_LENGTH)
 
 # ---------------------------
 # Utilities
@@ -599,7 +609,12 @@ def hybrid_search_with_rerank(question: str) -> Dict[str, List[Dict[str, Any]]]:
     if reranker is None:
         initialize_models()
 
-    scores = reranker.predict(pairs, show_progress_bar=False)
+    scores = reranker.compute_score(
+        pairs,
+        batch_size=RERANK_BATCH_SIZE,
+        max_length=RERANK_MAX_LENGTH,
+        normalize=True,
+    )
     reranked = []
     for cand, scr in zip(fused_for_rerank, scores):
         item = cand.copy()

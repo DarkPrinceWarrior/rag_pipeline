@@ -1,5 +1,21 @@
 
 import os
+import multiprocessing as mp
+# -------------------------------------------------
+# Конфигурация GPU/Видеопамяти до импортов
+# -------------------------------------------------
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+try:
+    mp.set_start_method("spawn", force=True)
+except Exception:
+    pass
+_xla_frac = os.getenv("RAG_XLA_MEM_FRACTION")
+if _xla_frac:
+    os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = _xla_frac
 import glob
 import faiss
 import pickle
@@ -21,7 +37,7 @@ import bm25s
 BASE_DIR = Path(__file__).resolve().parents[1]
 PDF_DIR = str(BASE_DIR / "pdfs")
 VECTOR_STORE_PATH = str(BASE_DIR / "faiss_index")  # directory where index and metadata are stored
-EMBEDDING_MODEL_NAME = "jinaai/jina-embeddings-v4"  # <-- ИЗМЕНЕНО: Замена на Jina v4
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
@@ -48,6 +64,28 @@ RERANK_BATCH_SIZE = 32
 # Рантайм-параметры для перевода (устанавливаются при создании цепочки)
 runtime_openrouter_api_key: str | None = None
 runtime_openrouter_model: str | None = None
+
+# ---------------------------
+# GPU-настройки (задаются через переменные окружения)
+# ---------------------------
+
+def _parse_gpu_ids(val: str) -> List[int]:
+    ids: List[int] = []
+    for part in (val or "").split(","):
+        s = part.strip()
+        if not s:
+            continue
+        try:
+            ids.append(int(s))
+        except ValueError:
+            continue
+    return ids or [0]
+
+# Список GPU для эмбеддинга и реранка
+EMBED_GPU_IDS: List[int] = _parse_gpu_ids(os.getenv("RAG_GPU_IDS_EMBED", "0,1"))
+RERANK_GPU_IDS: List[int] = _parse_gpu_ids(os.getenv("RAG_GPU_IDS_RERANK", "2"))
+RERANK_GPU_ID: int = RERANK_GPU_IDS[0]
+EMBED_BATCH_SIZE: int = int(os.getenv("RAG_EMBED_BATCH", "64"))
 
 # ---------------------------
 # Простой перевод RU → EN без доступа к корпусу
@@ -86,6 +124,55 @@ chunks_metadata = []
 # BM25S глобальные объекты
 bm25_retriever = None
 bm25_corpus_ids: List[int] = []
+
+# ---------------------------
+# Вспомогательное: мульти-GPU энкодинг эмбеддингов
+# ---------------------------
+
+def _chunk_iter(items: List[str], size: int) -> List[List[str]]:
+    return [items[i:i+size] for i in range(0, len(items), size)]
+
+def _worker_encode(args):
+    """Процесс-воркер: кодирует партию на выделенном GPU.
+
+    Параметры: (device_id, model_name, texts)
+    Возврат: np.ndarray float32
+    """
+    device_id, model_name, texts = args
+    from sentence_transformers import SentenceTransformer  # локальный импорт в процессе
+    import torch  # type: ignore
+    torch.cuda.set_device(device_id)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
+    model = SentenceTransformer(model_name, trust_remote_code=True, device="cuda")
+    emb = model.encode(
+        sentences=texts,
+        show_progress_bar=False,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    ).astype("float32")
+    return emb
+
+def _encode_multi_gpu(texts: List[str], batch_size: int, gpu_ids: List[int]) -> np.ndarray:
+    """Распределённое кодирование: делим тексты на партии и рассылку по GPU.
+
+    Баланс простой round-robin по списку gpu_ids. Собираем эмбеддинги в исходном порядке.
+    """
+    if not texts:
+        return np.zeros((0, 0), dtype="float32")
+    batches = _chunk_iter(texts, batch_size)
+    tasks = []
+    for i, b in enumerate(batches):
+        device_id = gpu_ids[i % len(gpu_ids)]
+        tasks.append((device_id, EMBEDDING_MODEL_NAME, b))
+
+    # Параллельный запуск воркеров
+    from multiprocessing import Pool
+    with Pool(processes=min(len(tasks), len(gpu_ids))) as pool:
+        results = pool.map(_worker_encode, tasks)
+
+    # Конкатенируем в исходном порядке партий
+    emb = np.concatenate(results, axis=0)
+    return emb
 
 # ---------------------------
 # Единый формат кандидата для ретрива
@@ -148,11 +235,12 @@ def collect_candidates_ru_en(question: str, k_dense: int = TOP_K_DENSE_BRANCH, k
     global faiss_index, chunks_metadata, embedder, bm25_retriever, bm25_corpus_ids
 
     # RU: Dense
+    # Кодируем вопрос на первом доступном GPU из EMBED_GPU_IDS
     q_ru_emb = embedder.encode(
         sentences=[question],
-        task="retrieval",
-        prompt_name="query",
         normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False,
     ).astype("float32")
     k_dense_eff = min(k_dense, faiss_index.ntotal if faiss_index is not None else 0)
     dense_ru: List[Dict[str, Any]] = []
@@ -174,9 +262,9 @@ def collect_candidates_ru_en(question: str, k_dense: int = TOP_K_DENSE_BRANCH, k
     # EN: Dense
     q_en_emb = embedder.encode(
         sentences=[en_question],
-        task="retrieval",
-        prompt_name="query",
         normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False,
     ).astype("float32")
     dense_en: List[Dict[str, Any]] = []
     if k_dense_eff > 0:
@@ -381,19 +469,35 @@ def truncate_candidates_for_rerank(candidates: List[Dict[str, Any]], max_tokens:
     return processed
 
 def initialize_models():
-    """Инициализирует и кэширует модели в глобальных переменных."""
+    """Инициализирует и кэширует модели в глобальных переменных.
+
+    GPU-правила:
+    - Эмбеддер создаётся один раз; инференс разбивается по EMBED_GPU_IDS через multiprocessing.
+    - Реранкер закрепляется за GPU RERANK_GPU_ID.
+    """
     global embedder, reranker
     if embedder is None:
-        embedder = SentenceTransformer(EMBEDDING_MODEL_NAME, trust_remote_code=True)
+        embedder = SentenceTransformer(
+            EMBEDDING_MODEL_NAME,
+            trust_remote_code=True,
+            device=f"cuda:{EMBED_GPU_IDS[0]}",
+        )
     if reranker is None:
-        # Мульти-язычный реранкер BGE v2 m3
-        use_fp16 = False
+        # Назначаем конкретный GPU для реранкера
         try:
             import torch  # type: ignore
-            use_fp16 = bool(getattr(torch.cuda, "is_available", lambda: False)())
+            has_cuda = bool(getattr(torch.cuda, "is_available", lambda: False)())
+            device = f"cuda:{RERANK_GPU_ID}" if has_cuda else "cuda:0"
+            use_fp16 = has_cuda
         except Exception:
+            device = "cuda:0"
             use_fp16 = False
-        reranker = FlagReranker(RERANKER_MODEL_NAME, use_fp16=use_fp16, max_length=RERANK_MAX_LENGTH)
+        reranker = FlagReranker(
+            RERANKER_MODEL_NAME,
+            use_fp16=use_fp16,
+            max_length=RERANK_MAX_LENGTH,
+            device=device,
+        )
 
 # ---------------------------
 # Utilities
@@ -518,16 +622,8 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
             all_chunks_text.append(c_text)
             doc_counter += 1
             
-    # Создание Dense (векторного) индекса
-    # ИЗМЕНЕНО: Используем Jina v4 с task="retrieval" и prompt_name="passage" для документов
-    embeddings = embedder.encode(
-        sentences=all_chunks_text,
-        task="retrieval",
-        prompt_name="passage",
-        show_progress_bar=False,
-        convert_to_numpy=True,
-        normalize_embeddings=True
-    ).astype("float32")
+    # Создание Dense (векторного) индекса с распределением по нескольким GPU
+    embeddings = _encode_multi_gpu(all_chunks_text, batch_size=EMBED_BATCH_SIZE, gpu_ids=EMBED_GPU_IDS)
     
     # --- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ ---
     # Используем быстрый HNSW-индекс вместо медленного IndexFlatIP

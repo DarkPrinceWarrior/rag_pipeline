@@ -53,6 +53,8 @@ with st.sidebar:
         accept_multiple_files=True
     )
     process_button = st.button("Обработать документы", type="primary")
+    st.divider()
+    lang_filter_flag = st.checkbox("Language filter ON", value=True, help="Включить приоритизацию кандидатов по языку (SAME_LANG_RATIO)")
 
 # --- Основная логика ---
 # Базовая директория проекта (корень), независимо от текущей рабочей директории
@@ -131,12 +133,15 @@ if prompt := st.chat_input("Ваш вопрос..."):
         with st.chat_message("assistant"):
             with st.spinner("Идет гибридный поиск, RRF и реранк..."):
                 try:
-                    result = hybrid_search_with_rerank(prompt)
+                    # Пробрасываем флаг в цепочку через глобальные настройки (параметр функции)
+                    result = hybrid_search_with_rerank(prompt, apply_lang_quota=bool(lang_filter_flag))
                     fused = result.get("fused", [])
                     reranked = result.get("reranked", [])
+                    q_lang = result.get("q_lang")
+                    active_branches = result.get("active_branches")
 
                     # Краткая сводка
-                    st.markdown(f"**Сводка:** {{'fused': {len(fused)}, 'reranked': {len(reranked)}}}")
+                    st.markdown(f"**Сводка:** {{'q_lang': '{q_lang}', 'active_branches': {active_branches}, 'fused': {len(fused)}, 'reranked': {len(reranked)}}}")
 
                     # Вспомогательная функция построения якоря для будущего просмотра PDF
                     def _make_anchor(item: dict) -> str:
@@ -177,6 +182,37 @@ if prompt := st.chat_input("Ваш вопрос..."):
                             for it in reranked[:5]
                         ]
                         st.dataframe(rows_rerank, use_container_width=True)
+
+                    # Показать языковые доли по веткам
+                    with st.expander("Языковые доли по веткам"):
+                        if active_branches:
+                            from rag_core import chunks_metadata
+                            def _share(items, target_lang):
+                                if not items:
+                                    return (0, 0, 0.0)
+                                same = 0
+                                for it in items:
+                                    cid = it.get("chunk_id")
+                                    if isinstance(cid, int) and 0 <= cid < len(chunks_metadata):
+                                        if chunks_metadata[cid].get("lang") == target_lang:
+                                            same += 1
+                                other = len(items) - same
+                                ratio = (same / len(items)) if len(items) else 0.0
+                                return (same, other, ratio)
+                        
+                        # Используем reranked как компактное представление top-N
+                        branch_map = {
+                            "dense_en": ('en', [it for it in fused if 'dense_en' in (it.get('hits') or [])]),
+                            "bm25_en": ('en', [it for it in fused if 'bm25_en' in (it.get('hits') or [])]),
+                            "dense_ru": ('ru', [it for it in fused if 'dense_ru' in (it.get('hits') or [])]),
+                            "bm25_ru": ('ru', [it for it in fused if 'bm25_ru' in (it.get('hits') or [])]),
+                        }
+                        for br in active_branches:
+                            target_lang, items = branch_map.get(br, (None, []))
+                            if not target_lang:
+                                continue
+                            same, other, share = _share(items, target_lang)
+                            st.write(f"{br}: same_lang={same}, other_lang={other}, share={share:.2f}")
 
                     st.session_state.messages.append({
                         "role": "assistant",

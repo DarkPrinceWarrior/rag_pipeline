@@ -21,3 +21,4 @@ PyStemmer
 jax[cuda12]
 FlagEmbedding
 accelerate
+stopwordsiso

@@ -30,6 +30,11 @@ from sentence_transformers import SentenceTransformer
 from FlagEmbedding import FlagReranker
 from langchain_docling import DoclingLoader
 import bm25s
+import re
+import unicodedata
+from lingua import Language, LanguageDetectorBuilder
+import Stemmer
+import stopwordsiso as stopwords
 
 # ---------------------------
 # Configuration (change if needed)
@@ -61,6 +66,12 @@ RERANK_MAX_TOKENS = 380
 RERANK_MAX_LENGTH = 512
 RERANK_BATCH_SIZE = 32
 
+# Порог длины текста для детекции языка по чанку (иначе используем страницу)
+LANG_DETECT_MIN_CHARS = 40
+
+# Квота кандидатов своего языка перед RRF (оставляем долю same_lang)
+SAME_LANG_RATIO = 0.8
+
 # Рантайм-параметры для перевода (устанавливаются при создании цепочки)
 runtime_openrouter_api_key: str | None = None
 runtime_openrouter_model: str | None = None
@@ -91,29 +102,49 @@ EMBED_BATCH_SIZE: int = int(os.getenv("RAG_EMBED_BATCH", "64"))
 # Простой перевод RU → EN без доступа к корпусу
 # ---------------------------
 
-def simple_query_translation(question: str) -> str:
-    """Простой машинный перевод запроса на английский без обращения к корпусу."""
-    if not question or not question.strip():
-        return ""
+def simple_query_translation(question: str, q_lang: str | None = None) -> Dict[str, str]:
+    """Правило перевода запроса в EN в зависимости от языка.
+
+    Возвращает словарь с ключами:
+    - original: исходный вопрос
+    - english: перевод на английский (или исходный, если EN)
+    """
+    original = question or ""
+    if not original.strip():
+        return {"original": "", "english": ""}
+
+    # Если очевидно EN — не переводим
+    if q_lang == 'en':
+        return {"original": original, "english": original}
+
+    # Если RU/UK/BE — делаем перевод
+    need_translation = q_lang in {'ru', 'uk', 'be'} if q_lang else True
+
     if not runtime_openrouter_api_key or not runtime_openrouter_model:
-        return question
+        # Без API — возвращаем оригинал в обоих полях, чтобы ветки EN могли работать с тем же текстом
+        return {"original": original, "english": original if not need_translation else original}
+
     messages = [
         {"role": "system", "content": "Translate this query to English. Do not add information."},
-        {"role": "user", "content": question},
+        {"role": "user", "content": original},
     ]
     try:
-        response_json = call_openrouter_chat_completion(
-            api_key=runtime_openrouter_api_key,
-            model=runtime_openrouter_model,
-            messages=messages,
-            extra_request_kwargs={"temperature": 0.2},
-        )
-        text = response_json.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-        if not text:
-            text = response_json.get("choices", [{}])[0].get("text", "").strip()
-        return text or question
+        if need_translation:
+            response_json = call_openrouter_chat_completion(
+                api_key=runtime_openrouter_api_key,
+                model=runtime_openrouter_model,
+                messages=messages,
+                extra_request_kwargs={"temperature": 0.2},
+            )
+            text = response_json.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            if not text:
+                text = response_json.get("choices", [{}])[0].get("text", "").strip()
+            english = text or original
+        else:
+            english = original
+        return {"original": original, "english": english}
     except Exception:
-        return question
+        return {"original": original, "english": original}
 
 # Глобальные переменные для хранения моделей и индексов
 embedder = None
@@ -124,6 +155,13 @@ chunks_metadata = []
 # BM25S глобальные объекты
 bm25_retriever = None
 bm25_corpus_ids: List[int] = []
+
+# Инструменты языка и токенизации
+language_detector = None
+ru_stemmer = None
+en_stemmer = None
+ru_stopwords = set()
+en_stopwords = set()
 
 # ---------------------------
 # Вспомогательное: мульти-GPU энкодинг эмбеддингов
@@ -139,10 +177,11 @@ def _worker_encode(args):
     Возврат: np.ndarray float32
     """
     device_id, model_name, texts = args
+    # Сначала ограничиваем видимость нужным GPU, затем выбираем локальный индекс 0
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
     from sentence_transformers import SentenceTransformer  # локальный импорт в процессе
     import torch  # type: ignore
-    torch.cuda.set_device(device_id)
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
+    torch.cuda.set_device(0)
     model = SentenceTransformer(model_name, trust_remote_code=True, device="cuda")
     emb = model.encode(
         sentences=texts,
@@ -183,6 +222,8 @@ RETRIEVAL_DENSE_RU = "dense_ru"
 RETRIEVAL_BM25_RU = "bm25_ru"
 RETRIEVAL_DENSE_EN = "dense_en"
 RETRIEVAL_BM25_EN = "bm25_en"
+RETRIEVAL_DENSE_ORIG = "dense_orig"
+RETRIEVAL_BM25_ORIG = "bm25_orig"
 
 def build_candidate_dict(chunk_global_id: int, retrieval_label: str, rank: int, score_raw: float) -> Dict[str, Any]:
     """Создает единый словарь для кандидата документа.
@@ -225,62 +266,112 @@ def build_candidates_from_arrays(indices: List[int], scores: List[float], retrie
 # Двухветочный ретривал (RU и EN) с четырьмя списками кандидатов
 # ---------------------------
 
-def collect_candidates_ru_en(question: str, k_dense: int = TOP_K_DENSE_BRANCH, k_bm25: int = TOP_K_BM25_BRANCH) -> Dict[str, List[Dict[str, Any]]]:
+def _detect_question_lang(question: str) -> str:
+    """Определяет язык вопроса: 'en', 'ru', 'uk', 'be' или 'unk'."""
+    if not question or not question.strip() or language_detector is None:
+        return 'unk'
+    try:
+        lang = language_detector.detect_language_of(question)
+        if lang == Language.ENGLISH:
+            return 'en'
+        if lang == Language.RUSSIAN:
+            return 'ru'
+        if lang == Language.UKRAINIAN:
+            return 'uk'
+        if lang == Language.BELARUSIAN:
+            return 'be'
+        return 'unk'
+    except Exception:
+        return 'unk'
+
+
+def collect_candidates_ru_en(question: str, k_dense: int = TOP_K_DENSE_BRANCH, k_bm25: int = TOP_K_BM25_BRANCH, apply_lang_quota: bool = True) -> Dict[str, List[Dict[str, Any]]]:
     """Возвращает 4 независимых списка кандидатов: dense_ru, bm25_ru, dense_en, bm25_en.
 
     Формат каждого кандидата соответствует build_candidate_dict.
     """
     if not question or not question.strip():
-        return {"dense_ru": [], "bm25_ru": [], "dense_en": [], "bm25_en": []}
+        return {"q_lang": _detect_question_lang(question), "dense_ru": [], "bm25_ru": [], "dense_en": [], "bm25_en": []}
 
     global faiss_index, chunks_metadata, embedder, bm25_retriever, bm25_corpus_ids
 
-    # RU: Dense
-    # Кодируем вопрос на первом доступном GPU из EMBED_GPU_IDS
-    q_ru_emb = embedder.encode(
-        sentences=[question],
-        normalize_embeddings=True,
-        convert_to_numpy=True,
-        show_progress_bar=False,
-    ).astype("float32")
+    q_lang = _detect_question_lang(question)
     k_dense_eff = min(k_dense, faiss_index.ntotal if faiss_index is not None else 0)
+
     dense_ru: List[Dict[str, Any]] = []
-    if k_dense_eff > 0:
-        ru_scores, ru_indices = faiss_index.search(q_ru_emb, k_dense_eff)
-        dense_ru = build_candidates_from_arrays(list(ru_indices[0]), list(ru_scores[0]), RETRIEVAL_DENSE_RU)
-
-    # RU: BM25S
     bm25_ru: List[Dict[str, Any]] = []
-    if bm25_retriever is not None and bm25_corpus_ids:
-        ru_query_tokens = bm25s.tokenize([question])
-        ru_results, ru_bm25_scores = bm25_retriever.retrieve(ru_query_tokens, k=k_bm25, corpus=bm25_corpus_ids)
-        if len(ru_results) > 0:
-            bm25_ru = build_candidates_from_arrays(list(ru_results[0]), list(ru_bm25_scores[0]), RETRIEVAL_BM25_RU)
-
-    # EN translation
-    en_question = simple_query_translation(question)
-
-    # EN: Dense
-    q_en_emb = embedder.encode(
-        sentences=[en_question],
-        normalize_embeddings=True,
-        convert_to_numpy=True,
-        show_progress_bar=False,
-    ).astype("float32")
     dense_en: List[Dict[str, Any]] = []
-    if k_dense_eff > 0:
-        en_scores, en_indices = faiss_index.search(q_en_emb, k_dense_eff)
-        dense_en = build_candidates_from_arrays(list(en_indices[0]), list(en_scores[0]), RETRIEVAL_DENSE_EN)
-
-    # EN: BM25S
     bm25_en: List[Dict[str, Any]] = []
-    if bm25_retriever is not None and bm25_corpus_ids:
-        en_query_tokens = bm25s.tokenize([en_question])
-        en_results, en_bm25_scores = bm25_retriever.retrieve(en_query_tokens, k=k_bm25, corpus=bm25_corpus_ids)
-        if len(en_results) > 0:
-            bm25_en = build_candidates_from_arrays(list(en_results[0]), list(en_bm25_scores[0]), RETRIEVAL_BM25_EN)
+
+    def _dense(query_text: str, label: str) -> List[Dict[str, Any]]:
+        if k_dense_eff <= 0:
+            return []
+        q_emb = embedder.encode(
+            sentences=[query_text],
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        ).astype("float32")
+        scores, indices = faiss_index.search(q_emb, k_dense_eff)
+        return build_candidates_from_arrays(list(indices[0]), list(scores[0]), label)
+
+    def _bm25(query_text: str, label: str, lang_for_query: str | None) -> List[Dict[str, Any]]:
+        if bm25_retriever is None or not bm25_corpus_ids:
+            return []
+        # Языко-зависимая токенизация запроса
+        q_tokens = tokenize_text_by_lang(query_text, lang_for_query)
+        tokens = [q_tokens]
+        res, scr = bm25_retriever.retrieve(tokens, k=k_bm25, corpus=bm25_corpus_ids)
+        if len(res) > 0:
+            return build_candidates_from_arrays(list(res[0]), list(scr[0]), label)
+        return []
+
+    def _apply_lang_quota(items: List[Dict[str, Any]], target_lang: str | None) -> List[Dict[str, Any]]:
+        if not items:
+            return items
+        if not target_lang:
+            return items
+        if not apply_lang_quota:
+            return items
+        same = [c for c in items if (chunks_metadata[c.get("chunk_id")].get("lang") == target_lang)]
+        other = [c for c in items if (chunks_metadata[c.get("chunk_id")].get("lang") != target_lang)]
+        if not same:
+            return items
+        n_total = len(items)
+        n_same = max(1, int(n_total * SAME_LANG_RATIO))
+        n_other = max(0, n_total - n_same)
+        same_cut = same[:n_same]
+        other_cut = other[:n_other]
+        return same_cut + other_cut
+
+    if q_lang == 'en':
+        # Только EN-ветка
+        tr = simple_query_translation(question, q_lang='en')
+        en_q = tr.get('english') or question
+        dense_en = _apply_lang_quota(_dense(en_q, RETRIEVAL_DENSE_EN), 'en')
+        bm25_en = _apply_lang_quota(_bm25(en_q, RETRIEVAL_BM25_EN, 'en'), 'en')
+    elif q_lang in {'ru', 'uk', 'be'}:
+        # Оригинал (RU/UK/BE) + EN перевод
+        tr = simple_query_translation(question, q_lang=q_lang)
+        orig_q = tr.get('original') or question
+        en_q = tr.get('english') or question
+        dense_ru = _apply_lang_quota(_dense(orig_q, RETRIEVAL_DENSE_RU), 'ru')
+        bm25_ru = _apply_lang_quota(_bm25(orig_q, RETRIEVAL_BM25_RU, q_lang), 'ru')
+        dense_en = _apply_lang_quota(_dense(en_q, RETRIEVAL_DENSE_EN), 'en')
+        bm25_en = _apply_lang_quota(_bm25(en_q, RETRIEVAL_BM25_EN, 'en'), 'en')
+    else:
+        # Прочие языки: ORIG + EN перевод
+        tr = simple_query_translation(question, q_lang='unk')
+        orig_q = tr.get('original') or question
+        en_q = tr.get('english') or question
+        # ORIG-ветка с отдельными метками
+        dense_ru = _apply_lang_quota(_dense(orig_q, RETRIEVAL_DENSE_ORIG), q_lang)
+        bm25_ru = _apply_lang_quota(_bm25(orig_q, RETRIEVAL_BM25_ORIG, q_lang), q_lang)
+        dense_en = _apply_lang_quota(_dense(en_q, RETRIEVAL_DENSE_EN), 'en')
+        bm25_en = _apply_lang_quota(_bm25(en_q, RETRIEVAL_BM25_EN, 'en'), 'en')
 
     result = {
+        "q_lang": q_lang,
         "dense_ru": dense_ru,
         "bm25_ru": bm25_ru,
         "dense_en": dense_en,
@@ -481,7 +572,7 @@ def initialize_models():
     - Эмбеддер создаётся один раз; инференс разбивается по EMBED_GPU_IDS через multiprocessing.
     - Реранкер закрепляется за GPU RERANK_GPU_ID.
     """
-    global embedder, reranker
+    global embedder, reranker, language_detector, ru_stemmer, en_stemmer, ru_stopwords, en_stopwords
     if embedder is None:
         embedder = SentenceTransformer(
             EMBEDDING_MODEL_NAME,
@@ -504,6 +595,33 @@ def initialize_models():
             max_length=RERANK_MAX_LENGTH,
             device=device,
         )
+    # Инициализация средств для языка/токенизации
+    if language_detector is None:
+        try:
+            langs = [Language.RUSSIAN, Language.ENGLISH, Language.UKRAINIAN, Language.BELARUSIAN]
+            language_detector = LanguageDetectorBuilder.from_languages(*langs).with_low_accuracy_mode().build()
+        except Exception:
+            language_detector = None
+    if ru_stemmer is None:
+        try:
+            ru_stemmer = Stemmer.Stemmer('russian')
+        except Exception:
+            ru_stemmer = None
+    if en_stemmer is None:
+        try:
+            en_stemmer = Stemmer.Stemmer('english')
+        except Exception:
+            en_stemmer = None
+    if not ru_stopwords:
+        try:
+            ru_stopwords = set(stopwords.stopwords('ru'))
+        except Exception:
+            ru_stopwords = set()
+    if not en_stopwords:
+        try:
+            en_stopwords = set(stopwords.stopwords('en'))
+        except Exception:
+            en_stopwords = set()
 
 # ---------------------------
 # Utilities
@@ -529,6 +647,44 @@ def format_citation(meta: Dict[str, Any]) -> str:
             return f"[{source} p.{page} {c0}–{c1}]"
         return f"[{source} p.{page}]"
     return f"[{source}:{meta.get('chunk_index')}]"
+
+def tokenize_text_by_lang(text: str, lang: str | None) -> List[str]:
+    """Токенизация текста с учётом языка (RU/EN) для BM25.
+
+    - Unicode-алфавитно-цифровое разделение
+    - Приведение к нижнему регистру
+    - Стемминг и удаление стоп-слов для RU/EN
+    - Fallback: стандартная bm25s.tokenize при неизвестном языке
+    """
+    s = (text or "").lower()
+    tokens: List[str] = []
+    buf: List[str] = []
+    for ch in s:
+        cat = unicodedata.category(ch)
+        if cat and (cat[0] == 'L' or cat[0] == 'N'):
+            buf.append(ch)
+        else:
+            if buf:
+                tokens.append(''.join(buf))
+                buf = []
+    if buf:
+        tokens.append(''.join(buf))
+    if lang == 'ru':
+        if ru_stemmer is not None:
+            tokens = ru_stemmer.stemWords(tokens)
+        if ru_stopwords:
+            tokens = [t for t in tokens if t not in ru_stopwords]
+        return tokens
+    if lang == 'en':
+        if en_stemmer is not None:
+            tokens = en_stemmer.stemWords(tokens)
+        if en_stopwords:
+            tokens = [t for t in tokens if t not in en_stopwords]
+        return tokens
+    try:
+        return bm25s.tokenize([text])[0]
+    except Exception:
+        return tokens
 
 # ---------------------------
 # PDF Loading & Text Extraction
@@ -657,6 +813,17 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
             # Инкрементальный курсор по странице для корректной привязки смещений
             cursor = 0
             page_len = len(page_text)
+            # Предварительная детекция языка страницы (если понадобится как fallback)
+            page_lang = None
+            if language_detector is not None:
+                try:
+                    page_lang_detected = language_detector.detect_language_of(page_text)
+                    if page_lang_detected == Language.RUSSIAN:
+                        page_lang = 'ru'
+                    elif page_lang_detected == Language.ENGLISH:
+                        page_lang = 'en'
+                except Exception:
+                    page_lang = None
             for c_text in raw_chunks:
                 if not isinstance(c_text, str):
                     continue
@@ -671,6 +838,20 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
                     # Если не нашли, используем безопасный минимум
                     start_idx = max(0, min(cursor, max(0, page_len - 1)))
                 end_idx = start_idx + len(c_text) - 1 if page_len > 0 else 0
+                # Детекция языка чанка
+                lang_code = None
+                try:
+                    text_for_lang = c_text if len(c_text) >= LANG_DETECT_MIN_CHARS else page_text
+                    if language_detector is not None:
+                        lang = language_detector.detect_language_of(text_for_lang)
+                        if lang == Language.RUSSIAN:
+                            lang_code = 'ru'
+                        elif lang == Language.ENGLISH:
+                            lang_code = 'en'
+                except Exception:
+                    lang_code = None
+                if lang_code is None:
+                    lang_code = page_lang or 'unk'
                 chunks_metadata.append({
                     "source": filename,
                     "chunk_index": doc_counter,
@@ -678,6 +859,7 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
                     "page": int(page_num) if isinstance(page_num, int) and page_num > 0 else 1,
                     "char_start": int(start_idx),
                     "char_end": int(end_idx),
+                    "lang": lang_code,
                 })
                 all_chunks_text.append(c_text)
                 # Шаг курсора: длина чанка минус overlap; гарантируем прогресс минимум на 1
@@ -703,13 +885,49 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
     for idx, meta in enumerate(chunks_metadata):
         t = meta.get("text")
         if isinstance(t, str):
-            s = t.strip()
-            if s:
-                texts_for_bm25.append(s)
+            if t.strip():
+                texts_for_bm25.append((t, meta.get("lang")))
                 bm25_corpus_ids.append(idx)
     if not texts_for_bm25:
         raise RuntimeError("BM25 корпус пуст после фильтрации.")
-    corpus_tokens = bm25s.tokenize(texts_for_bm25)
+
+    def _tokenize_lang(text: str, lang: str | None) -> List[str]:
+        s = text.lower()
+        # Unicode-алфавитно-цифровая токенизация без \p-классов (совместимая с stdlib re)
+        tokens: List[str] = []
+        buf: List[str] = []
+        for ch in s:
+            cat = unicodedata.category(ch)
+            if cat and (cat[0] == 'L' or cat[0] == 'N'):
+                buf.append(ch)
+            else:
+                if buf:
+                    tokens.append(''.join(buf))
+                    buf = []
+        if buf:
+            tokens.append(''.join(buf))
+        if lang == 'ru':
+            if ru_stemmer is not None:
+                tokens = ru_stemmer.stemWords(tokens)
+            if ru_stopwords:
+                tokens = [t for t in tokens if t not in ru_stopwords]
+            return tokens
+        if lang == 'en':
+            if en_stemmer is not None:
+                tokens = en_stemmer.stemWords(tokens)
+            if en_stopwords:
+                tokens = [t for t in tokens if t not in en_stopwords]
+            return tokens
+        # Fallback — стандартная токенизация bm25s
+        try:
+            return bm25s.tokenize([text])[0]
+        except Exception:
+            return tokens
+
+    corpus_tokens: List[List[str]] = []
+    for text, lang in texts_for_bm25:
+        corpus_tokens.append(_tokenize_lang(text, lang if isinstance(lang, str) else None))
+
     bm25_retriever = bm25s.BM25(method="lucene")
     bm25_retriever.index(corpus_tokens)
     ensure_dir(bm25_dir)
@@ -741,21 +959,21 @@ def call_openrouter_chat_completion(api_key, model, messages, endpoint=OPENROUTE
 # ---------------------------
 
 # Новая функция гибридного поиска, которая будет вызываться из answer_question
-def hybrid_search_with_rerank(question: str) -> Dict[str, List[Dict[str, Any]]]:
+def hybrid_search_with_rerank(question: str, apply_lang_quota: bool = True) -> Dict[str, List[Dict[str, Any]]]:
     """Гибридный поиск с RRF-слиянием и реранком.
 
     Возвращает структуру вида {"fused": fused_top[:20], "reranked": reranked_top}.
     """
     if not question or not question.strip():
-        return {"fused": [], "reranked": []}
+        return {"q_lang": _detect_question_lang(question), "active_branches": [], "fused": [], "reranked": []}
 
-    # Сбор кандидатов по четырем веткам
-    cands_by_branch = collect_candidates_ru_en(question)
+    # Сбор кандидатов по веткам с учетом языка вопроса
+    cands_by_branch = collect_candidates_ru_en(question, apply_lang_quota=apply_lang_quota)
 
     # RRF-слияние
     fused_top = fuse_candidates_rrf(cands_by_branch)
     if not fused_top:
-        return {"fused": [], "reranked": []}
+        return {"q_lang": cands_by_branch.get("q_lang"), "active_branches": [k for k in ("dense_ru","bm25_ru","dense_en","bm25_en") if cands_by_branch.get(k)], "fused": [], "reranked": []}
 
     # Подготовка текста для реранка
     fused_for_rerank = truncate_candidates_for_rerank(fused_top)
@@ -783,7 +1001,12 @@ def hybrid_search_with_rerank(question: str) -> Dict[str, List[Dict[str, Any]]]:
     reranked.sort(key=lambda x: x.get("rerank_score", 0.0), reverse=True)
     reranked_top = reranked[:TOP_K_FINAL]
 
-    return {"fused": fused_top[:20], "reranked": reranked_top}
+    return {
+        "q_lang": cands_by_branch.get("q_lang"),
+        "active_branches": [k for k in ("dense_ru","bm25_ru","dense_en","bm25_en") if cands_by_branch.get(k)],
+        "fused": fused_top[:20],
+        "reranked": reranked_top,
+    }
 
 # --- ГЛАВНАЯ ОБНОВЛЕННАЯ ФУНКЦИЯ ---
 def create_rag_chain(openrouter_api_key: str, openrouter_model: str = OPENROUTER_MODEL):

@@ -100,9 +100,53 @@ LANG_DETECT_MIN_CHARS = 40
 # Квота кандидатов своего языка перед RRF (оставляем долю same_lang)
 SAME_LANG_RATIO = 0.8
 
+# ---------------------------
+# Контекст: MMR, дедупликация, квоты и бюджет
+# ---------------------------
+CONTEXT_TOP_K = int(os.getenv("RAG_CONTEXT_TOP_K", "6"))
+MMR_LAMBDA = float(os.getenv("RAG_MMR_LAMBDA", "0.5"))
+MMR_POOL_K = int(os.getenv("RAG_MMR_POOL_K", "24"))
+DUP_EMB_COS_THRESHOLD = float(os.getenv("RAG_DUP_EMB_COS_THRESHOLD", "0.90"))
+DUP_CHAR_IOU_THRESHOLD = float(os.getenv("RAG_DUP_CHAR_IOU_THRESHOLD", "0.60"))
+PER_DOC_CAP = int(os.getenv("RAG_PER_DOC_CAP", "2"))
+PER_PAGE_CAP = int(os.getenv("RAG_PER_PAGE_CAP", "1"))
+# Минимальные квоты по языкам: ожидается JSON-подобная строка, по умолчанию {"ru":1, "en":1}
+_lang_min_cover_env = os.getenv("RAG_LANG_MIN_COVER", "{\"ru\":1, \"en\":1}")
+try:
+    LANG_MIN_COVER = json.loads(_lang_min_cover_env)
+except Exception:
+    LANG_MIN_COVER = {"ru": 1, "en": 1}
+CONTEXT_TOKENS_BUDGET = int(os.getenv("RAG_CONTEXT_TOKENS_BUDGET", "1200"))
+
+# Ограничение длины фрагмента источника, передаваемого в генератор
+SNIPPET_MAX_CHARS = int(os.getenv("RAG_SNIPPET_MAX_CHARS", "650"))
+
+# Порог доли целевого языка в тексте ответа для LID-проверки
+REGEN_LANG_RATIO_THRESHOLD = float(os.getenv("RAG_LANG_RATIO_THRESHOLD", "0.9"))
+
+# Ограничение на длину прямой цитаты в словах
+MAX_QUOTE_WORDS = int(os.getenv("RAG_MAX_QUOTE_WORDS", "30"))
+
+# Порог «недостаточно данных» по сумме rerank_score (0 = отключено)
+INSUFFICIENT_MIN_RERANK_SUM = float(os.getenv("RAG_MIN_RERANK_SUM", "0.0"))
+
+# Значения по умолчанию для LLM-параметров
+LLM_DEFAULT_TEMPERATURE = float(os.getenv("RAG_LLM_TEMPERATURE", "0.2"))
+LLM_DEFAULT_MAX_TOKENS = int(os.getenv("RAG_LLM_MAX_TOKENS", "550"))
+
+# Параметры стратегии ослабления, если контекст не набран
+RELAX_DUP_EMB_COS_STEP = float(os.getenv("RAG_RELAX_DUP_COS_STEP", "0.02"))
+RELAX_DUP_EMB_COS_MAX = float(os.getenv("RAG_RELAX_DUP_COS_MAX", "0.96"))
+
 # Рантайм-параметры для перевода (устанавливаются при создании цепочки)
 runtime_openrouter_api_key: str | None = None
 runtime_openrouter_model: str | None = None
+
+# Рантайм-настройки генерации
+runtime_llm_temperature: float | None = None
+runtime_llm_max_tokens: int | None = None
+runtime_enforce_citations: bool = True
+runtime_language_enforcement: bool = True
 
 # ---------------------------
 # GPU-настройки (задаются через переменные окружения)
@@ -179,6 +223,7 @@ embedder = None
 reranker = None
 faiss_index = None
 chunks_metadata = []
+EMB_MATRIX = None
 
 # BM25S глобальные объекты
 bm25_retriever = None
@@ -696,6 +741,57 @@ def debug_log(message: str, *args: Any) -> None:
     except Exception:
         pass
 
+def _get_chunk_vec(idx: int) -> np.ndarray:
+    """Возвращает L2-нормализованный вектор чанка по индексу из EMB_MATRIX.
+
+    Требует, чтобы EMB_MATRIX был загружен (np.memmap через np.load(..., mmap_mode='r')).
+    """
+    if EMB_MATRIX is None:
+        raise RuntimeError("Матрица эмбеддингов не загружена (EMB_MATRIX is None).")
+    if not isinstance(idx, (int, np.integer)) or int(idx) < 0 or int(idx) >= EMB_MATRIX.shape[0]:
+        raise ValueError("Некорректный индекс чанка для EMB_MATRIX.")
+    row = EMB_MATRIX[int(idx)]
+    vec = np.asarray(row, dtype="float32")
+    # Гарантируем L2-нормировку (на случай старого файла)
+    try:
+        norm2 = float(np.dot(vec, vec))
+        if not (0.999 <= norm2 <= 1.001):
+            v = vec.reshape(1, -1).copy()
+            faiss.normalize_L2(v)
+            return v[0]
+        return vec
+    except Exception:
+        return vec
+
+def _count_tokens_simple(text: str | None) -> int:
+    """Грубая оценка количества токенов по пробельному разделению."""
+    if not isinstance(text, str) or not text:
+        return 0
+    return len(text.split())
+
+def _l2_normalize(vec: np.ndarray) -> np.ndarray:
+    """L2-нормализация вектора, безопасная к нулевым нормам."""
+    v = np.asarray(vec, dtype="float32")
+    n = float(np.linalg.norm(v))
+    if n <= 0.0:
+        return v
+    return v / n
+
+def _estimate_tokens(text: str | None, lang: str | None) -> int:
+    """Приблизительная оценка токенов:
+    - EN: ~4 символа на токен
+    - RU: ~3.5 символа на токен
+    - Fallback: длина/4
+    """
+    if not isinstance(text, str) or not text:
+        return 0
+    length = len(text)
+    if lang == 'ru':
+        return int(length / 3.5)
+    if lang == 'en':
+        return int(length / 4.0)
+    return int(length / 4.0)
+
 def format_citation(meta: Dict[str, Any]) -> str:
     """Форматирует ссылку на источник из метаданных чанка.
 
@@ -825,6 +921,7 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
     metadata_path = os.path.join(index_dir, "metadata.pkl")
     bm25_dir = os.path.join(index_dir, "bm25")
     bm25_ids_path = os.path.join(index_dir, "bm25_ids.pkl")
+    emb_path = os.path.join(index_dir, "embeddings.npy")
 
     if force_rebuild:
         for path in [faiss_path, metadata_path]:
@@ -837,6 +934,8 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
             os.rmdir(bm25_dir)
         if os.path.exists(bm25_ids_path):
             os.remove(bm25_ids_path)
+        if os.path.exists(emb_path):
+            os.remove(emb_path)
 
     bm25_loaded = False
     if os.path.exists(faiss_path) and os.path.exists(metadata_path) and os.path.isdir(bm25_dir):
@@ -854,6 +953,14 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
         except Exception:
             pass
         with open(metadata_path, "rb") as f: chunks_metadata = pickle.load(f)
+        # Меммап матрицы эмбеддингов, если существует
+        global EMB_MATRIX
+        EMB_MATRIX = None
+        try:
+            if os.path.exists(emb_path):
+                EMB_MATRIX = np.load(emb_path, mmap_mode='r')
+        except Exception:
+            EMB_MATRIX = None
         # Загрузка BM25 индекса и ID корпуса
         try:
             bm25_retriever = bm25s.BM25.load(bm25_dir, load_corpus=False, mmap=False)
@@ -1039,6 +1146,12 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
     with open(bm25_ids_path, "wb") as f:
         pickle.dump(bm25_corpus_ids, f)
 
+    # Сохраняем матрицу эмбеддингов для последующего меммапа
+    try:
+        np.save(emb_path, embeddings.astype('float32'), allow_pickle=False)
+    except Exception:
+        pass
+
     with open(metadata_path, "wb") as f: pickle.dump(chunks_metadata, f)
     return True
 
@@ -1063,13 +1176,24 @@ def call_openrouter_chat_completion(api_key, model, messages, endpoint=OPENROUTE
 # ---------------------------
 
 # Новая функция гибридного поиска, которая будет вызываться из answer_question
-def hybrid_search_with_rerank(question: str, apply_lang_quota: bool = True) -> Dict[str, List[Dict[str, Any]]]:
+def hybrid_search_with_rerank(question: str, apply_lang_quota: bool = True) -> Dict[str, Any]:
     """Гибридный поиск с RRF-слиянием и реранком.
 
     Возвращает структуру вида {"fused": fused_top[:20], "reranked": reranked_top}.
     """
     if not question or not question.strip():
-        return {"q_lang": _detect_question_lang(question), "active_branches": [], "fused": [], "reranked": []}
+        _ql = _detect_question_lang(question)
+        _al = _ql if _ql in {"ru", "en"} else "ru"
+        return {
+            "q_lang": _ql,
+            "answer_lang": _al,
+            "active_branches": [],
+            "fused": [],
+            "reranked": [],
+            "context_pack": [],
+            "context_stats": {},
+            "sources_map": {},
+        }
 
     # Сбор кандидатов по веткам с учетом языка вопроса
     cands_by_branch = collect_candidates_ru_en(question, apply_lang_quota=apply_lang_quota)
@@ -1077,7 +1201,18 @@ def hybrid_search_with_rerank(question: str, apply_lang_quota: bool = True) -> D
     # RRF-слияние
     fused_top = fuse_candidates_rrf(cands_by_branch)
     if not fused_top:
-        return {"q_lang": cands_by_branch.get("q_lang"), "active_branches": [k for k in ("dense_ru","bm25_ru","dense_en","bm25_en") if cands_by_branch.get(k)], "fused": [], "reranked": []}
+        _ql = cands_by_branch.get("q_lang")
+        _al = _ql if _ql in {"ru", "en"} else "ru"
+        return {
+            "q_lang": _ql,
+            "answer_lang": _al,
+            "active_branches": [k for k in ("dense_ru","bm25_ru","dense_en","bm25_en") if cands_by_branch.get(k)],
+            "fused": [],
+            "reranked": [],
+            "context_pack": [],
+            "context_stats": {},
+            "sources_map": {},
+        }
 
     # Подготовка текста для реранка
     fused_for_rerank = truncate_candidates_for_rerank(fused_top)
@@ -1105,39 +1240,627 @@ def hybrid_search_with_rerank(question: str, apply_lang_quota: bool = True) -> D
     reranked.sort(key=lambda x: x.get("rerank_score", 0.0), reverse=True)
     reranked_top = reranked[:TOP_K_FINAL]
 
+    # Отбор финального контекста после MMR/дедуп/квот/бюджета
+    context_selection = select_context_for_generation(question, reranked_top, apply_lang_quota=apply_lang_quota)
+    context_pack = context_selection.get("selected", [])
+    rejected_list = context_selection.get("rejected", [])
+    debug_info = context_selection.get("debug", {})
+
+    # Агрегации для краткой диагностики
+    # Распределение по языкам/файлам/страницам
+    lang_distribution = dict(debug_info.get("lang_count", {}))
+    doc_distribution = dict(debug_info.get("per_doc", {}))
+    page_distribution = dict(debug_info.get("per_page", {}))
+
+    # Счётчик причин отклонений
+    rejected_reasons: Dict[str, int] = {}
+    for r in rejected_list:
+        reason = r.get("reason")
+        if isinstance(reason, str) and reason:
+            rejected_reasons[reason] = rejected_reasons.get(reason, 0) + 1
+
+    # Использованные пороги/флаги
+    relax_used = debug_info.get("relax", {}) if isinstance(debug_info.get("relax"), dict) else {}
+    context_stats = {
+        "selected_count": int(debug_info.get("selected", len(context_pack))),
+        "pool_initial": int(debug_info.get("pool_initial", 0)),
+        "budget_used_tokens": int(debug_info.get("used_tokens", 0)),
+        "budget_limit": int(CONTEXT_TOKENS_BUDGET),
+        "lang_distribution": lang_distribution,
+        "doc_distribution": doc_distribution,
+        "page_distribution": page_distribution,
+        "rejected_reasons": rejected_reasons,
+        "thresholds": {
+            "dup_emb_cos_threshold": float(relax_used.get("dup_cos_threshold", DUP_EMB_COS_THRESHOLD)),
+            "dup_char_iou_threshold": float(DUP_CHAR_IOU_THRESHOLD),
+            "per_doc_cap": int(PER_DOC_CAP),
+            "per_page_cap": int(PER_PAGE_CAP),
+            "ignore_per_page": bool(relax_used.get("ignore_per_page", False)),
+            "ignore_lang_cover": bool(relax_used.get("ignore_lang_cover", False)),
+            "mmr_lambda": float(MMR_LAMBDA),
+            "context_top_k": int(CONTEXT_TOP_K),
+        },
+    }
+
+    # Карта источников для цитирования: S1 -> chunk_id, по порядку context_pack
+    sources_map: Dict[str, int] = {}
+    try:
+        for idx, c in enumerate(context_pack):
+            cid = c.get("chunk_id")
+            if isinstance(cid, (int, np.integer)):
+                sources_map[f"S{idx+1}"] = int(cid)
+    except Exception:
+        sources_map = {}
+
+    # Язык ответа: совпадает с языком вопроса для {'ru','en'}, иначе 'ru'
+    _ql = cands_by_branch.get("q_lang")
+    answer_lang = _ql if _ql in {"ru", "en"} else "ru"
+
     return {
-        "q_lang": cands_by_branch.get("q_lang"),
+        "q_lang": _ql,
+        "answer_lang": answer_lang,
         "active_branches": [k for k in ("dense_ru","bm25_ru","dense_en","bm25_en") if cands_by_branch.get(k)],
         "fused": fused_top[:20],
         "reranked": reranked_top,
+        "context_pack": context_pack,
+        "context_stats": context_stats,
+        "sources_map": sources_map,
     }
 
 # --- ГЛАВНАЯ ОБНОВЛЕННАЯ ФУНКЦИЯ ---
-def create_rag_chain(openrouter_api_key: str, openrouter_model: str = OPENROUTER_MODEL):
+def create_rag_chain(
+    openrouter_api_key: str,
+    openrouter_model: str = OPENROUTER_MODEL,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    enforce_citations: bool = True,
+    language_enforcement: bool = True,
+):
     """
     Создает RAG-цепочку, интегрируя перевод, гибридный поиск и переранжирование.
     """
     
     # Прокидываем рантайм-параметры для simple_query_translation
     global runtime_openrouter_api_key, runtime_openrouter_model
+    global runtime_llm_temperature, runtime_llm_max_tokens
+    global runtime_enforce_citations, runtime_language_enforcement
     runtime_openrouter_api_key = openrouter_api_key
     runtime_openrouter_model = openrouter_model
+    runtime_llm_temperature = float(temperature) if isinstance(temperature, (int, float)) else LLM_DEFAULT_TEMPERATURE
+    runtime_llm_max_tokens = int(max_tokens) if isinstance(max_tokens, (int, float)) else LLM_DEFAULT_MAX_TOKENS
+    runtime_enforce_citations = bool(enforce_citations)
+    runtime_language_enforcement = bool(language_enforcement)
     
-    def answer_question(question: str) -> tuple[str, str]:
-        # Считаем кандидатов по веткам для статистики
-        branch_cands = collect_candidates_ru_en(question)
-        # Выполняем гибридный поиск с RRF и реранком
-        hybrid_out = hybrid_search_with_rerank(question)
-        stats = {
-            "branch_counts": {k: len(v) for k, v in branch_cands.items()},
-            "fused_size": len(hybrid_out.get("fused", [])),
-            "reranked_size": len(hybrid_out.get("reranked", [])),
+    def answer_question(question: str, apply_lang_quota: bool | None = None) -> Dict[str, Any]:
+        """Генерация ответа с жёстким контролем языка, проверкой цитат и политикой недостаточности.
+
+        Возвращает словарь:
+        - final_answer: текст ответа
+        - used_sources: список таких меток, как ["S1","S3",...]
+        - answer_lang_detected: язык по детектору
+        - flags: {"regenerated_for_lang": bool, "regenerated_for_citations": bool, "insufficient": bool}
+        """
+        target_lang = _detect_question_lang(question)
+        if target_lang not in {"ru", "en"}:
+            target_lang = "ru"
+
+        # Гибридный поиск и формирование контекста
+        hybrid_out = hybrid_search_with_rerank(question, apply_lang_quota=bool(apply_lang_quota) if apply_lang_quota is not None else True)
+        context_pack = hybrid_out.get("context_pack", []) or []
+        reranked = hybrid_out.get("reranked", []) or []
+        sources_map = hybrid_out.get("sources_map", {}) or {}
+
+        # Политика «Недостаточно данных»
+        insufficient = False
+        if not context_pack:
+            insufficient = True
+        else:
+            try:
+                rerank_sum = float(sum(float(it.get("rerank_score", 0.0)) for it in reranked))
+            except Exception:
+                rerank_sum = 0.0
+            if float(INSUFFICIENT_MIN_RERANK_SUM) > 0.0 and rerank_sum < float(INSUFFICIENT_MIN_RERANK_SUM):
+                insufficient = True
+            # Проверка покрытия целевого языка в контексте
+            try:
+                has_target_lang = False
+                for it in context_pack:
+                    cid = it.get("chunk_id")
+                    if isinstance(cid, (int, np.integer)) and 0 <= int(cid) < len(chunks_metadata):
+                        if chunks_metadata[int(cid)].get("lang") == target_lang:
+                            has_target_lang = True
+                            break
+                if target_lang in {"ru", "en"} and not has_target_lang:
+                    insufficient = True
+            except Exception:
+                pass
+
+        if insufficient:
+            return {
+                "final_answer": "Недостаточно данных для надёжного ответа. Нужны релевантные источники по вашему вопросу.",
+                "used_sources": [],
+                "answer_lang_detected": target_lang,
+                "flags": {
+                    "regenerated_for_lang": False,
+                    "regenerated_for_citations": False,
+                    "insufficient": True,
+                },
+            }
+
+        # Построение промпта
+        messages = build_generation_prompt(
+            question=question,
+            context_pack=context_pack,
+            sources_map=sources_map,
+            target_lang=target_lang,
+        )
+
+        # Вызов LLM
+        response_json = call_openrouter_chat_completion(
+            api_key=runtime_openrouter_api_key,
+            model=runtime_openrouter_model,
+            messages=messages,
+            extra_request_kwargs={
+                "temperature": float(runtime_llm_temperature if runtime_llm_temperature is not None else LLM_DEFAULT_TEMPERATURE),
+                "max_tokens": int(runtime_llm_max_tokens if runtime_llm_max_tokens is not None else LLM_DEFAULT_MAX_TOKENS),
+            },
+        )
+        draft = response_json.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or response_json.get("choices", [{}])[0].get("text", "").strip()
+
+        regenerated_for_lang = False
+        regenerated_for_citations = False
+
+        # Языковая проверка и однократная перегенерация
+        if runtime_language_enforcement:
+            ratio = _language_ratio_simple(draft, target_lang)
+            if ratio < float(REGEN_LANG_RATIO_THRESHOLD):
+                debug_log("[REGEN_LANG] ratio=%.3f < thr=%.3f, target=%s", float(ratio), float(REGEN_LANG_RATIO_THRESHOLD), str(target_lang))
+                regen_messages = [
+                    {"role": "system", "content": f"Ты нарушил инструкции. Перепиши ответ строго на {target_lang} без примесей других языков, сохраняя смысл и цитаты [S#]."},
+                    {"role": "user", "content": draft},
+                ]
+                response_json2 = call_openrouter_chat_completion(
+                    api_key=runtime_openrouter_api_key,
+                    model=runtime_openrouter_model,
+                    messages=regen_messages,
+                    extra_request_kwargs={
+                        "temperature": float(runtime_llm_temperature if runtime_llm_temperature is not None else LLM_DEFAULT_TEMPERATURE),
+                        "max_tokens": int(runtime_llm_max_tokens if runtime_llm_max_tokens is not None else LLM_DEFAULT_MAX_TOKENS),
+                    },
+                )
+                draft2 = response_json2.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or response_json2.get("choices", [{}])[0].get("text", "").strip()
+                if draft2:
+                    draft = draft2
+                    regenerated_for_lang = True
+
+        # Извлекаем использованные источники
+        valid_labels = [f"S{i+1}" for i in range(len(context_pack))]
+        used_sources = _extract_used_sources(draft, valid_labels)
+
+        # Проверка ссылок и однократная перегенерация
+        if runtime_enforce_citations and context_pack and not used_sources:
+            debug_log("[REGEN_CIT] no citations in draft, enforcing")
+            # Сформируем компактный список источников для явной привязки
+            msg_sources = []
+            for idx, item in enumerate(context_pack):
+                label = f"S{idx+1}"
+                src = item.get("source")
+                pg = item.get("page")
+                msg_sources.append(f"{label} — {src}, p.{pg}")
+            regen_messages_cit = [
+                {"role": "system", "content": (
+                    f"Отвечай только на языке: {target_lang}. Добавь явные ссылки [S#] на тезисы. "
+                    "Строго используй S# из списка \"Источники\" ниже. "
+                    "Не вставляй длинные прямые цитаты; перефразируй."
+                )},
+                {"role": "user", "content": (
+                    f"Вопрос:\n{question}\n\nИсточники:\n" + "\n".join(msg_sources) + "\n\nТекущий ответ:\n" + draft
+                )},
+            ]
+            response_json3 = call_openrouter_chat_completion(
+                api_key=runtime_openrouter_api_key,
+                model=runtime_openrouter_model,
+                messages=regen_messages_cit,
+                extra_request_kwargs={
+                    "temperature": float(runtime_llm_temperature if runtime_llm_temperature is not None else LLM_DEFAULT_TEMPERATURE),
+                    "max_tokens": int(runtime_llm_max_tokens if runtime_llm_max_tokens is not None else LLM_DEFAULT_MAX_TOKENS),
+                },
+            )
+            draft3 = response_json3.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or response_json3.get("choices", [{}])[0].get("text", "").strip()
+            if draft3:
+                draft = draft3
+                regenerated_for_citations = True
+                used_sources = _extract_used_sources(draft, valid_labels)
+
+        answer_lang_detected = _detect_question_lang(draft)
+        return {
+            "final_answer": draft,
+            "used_sources": used_sources,
+            "answer_lang_detected": answer_lang_detected,
+            "flags": {
+                "regenerated_for_lang": bool(regenerated_for_lang),
+                "regenerated_for_citations": bool(regenerated_for_citations),
+                "insufficient": False,
+            },
         }
-        stats_str = json.dumps(stats, ensure_ascii=False)
-        # Пустой ответ LLM на этом шаге; генерация будет добавлена позже
-        return "", stats_str
 
     return { "answer_question": answer_question }
+
+
+# ---------------------------
+# Контекст: MMR + дедупликация
+# ---------------------------
+
+def _compute_char_iou(a0: int, a1: int, b0: int, b1: int) -> float:
+    """Вычисляет IoU отрезков по символам [a0,a1], [b0,b1]."""
+    if a0 > a1 or b0 > b1:
+        return 0.0
+    inter_left = max(a0, b0)
+    inter_right = min(a1, b1)
+    inter_len = max(0, inter_right - inter_left + 1)
+    union_left = min(a0, b0)
+    union_right = max(a1, b1)
+    union_len = max(1, union_right - union_left + 1)
+    return float(inter_len) / float(union_len)
+
+def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    """Косинусная близость для L2-нормализованных векторов."""
+    return float(np.dot(a.astype('float32'), b.astype('float32')))
+
+def _get_candidate_vec(cand: Dict[str, Any]) -> np.ndarray:
+    """Возвращает вектор эмбеддинга для кандидата из EMB_MATRIX."""
+    cid = cand.get("chunk_id")
+    if not isinstance(cid, (int, np.integer)):
+        raise ValueError("Некорректный chunk_id кандидата.")
+    return _get_chunk_vec(int(cid))
+
+def _candidate_lang(cand: Dict[str, Any]) -> str | None:
+    try:
+        cid = cand.get("chunk_id")
+        if isinstance(cid, (int, np.integer)) and 0 <= int(cid) < len(chunks_metadata):
+            return chunks_metadata[int(cid)].get("lang")
+    except Exception:
+        return None
+    return None
+
+def select_context_for_generation(question: str, reranked_top: List[Dict[str, Any]], apply_lang_quota: bool = True) -> Dict[str, Any]:
+    """Отбирает финальный контекст для генерации на основе MMR + дедуп + квот и бюджета.
+
+    Возвращает словарь:
+    - selected: список отобранных кандидатов
+    - rejected: список отклонённых с причинами
+    - debug: краткая сводка параметров
+    """
+    pool = list(reranked_top[: min(MMR_POOL_K, len(reranked_top))])
+    selected: List[Dict[str, Any]] = []
+    rejected: List[Dict[str, Any]] = []
+
+    if not pool:
+        return {"selected": [], "rejected": [], "debug": {"reason": "empty_pool"}}
+
+    # Эмбеддинг вопроса (CPU, без VRAM), L2-нормализуем
+    global embedder
+    if embedder is None:
+        initialize_models()
+    q_vec = embedder.encode([question], normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False).astype('float32')[0]
+    q_vec = _l2_normalize(q_vec)
+
+    # Текущие квоты по источникам/страницам и языкам
+    per_doc_count: Dict[str, int] = {}
+    per_page_count: Dict[tuple, int] = {}
+    lang_count: Dict[str, int] = {k: 0 for k in LANG_MIN_COVER.keys()}
+
+    # Текущий бюджет по токенам
+    used_tokens = 0
+
+    # Эффективные настройки ослабления (можно менять внутри функции)
+    effective_dup_emb_cos_threshold = float(DUP_EMB_COS_THRESHOLD)
+    ignore_per_page_cap = False
+    ignore_lang_min_cover = (not bool(apply_lang_quota))
+
+    def _on_accept(cand: Dict[str, Any]) -> None:
+        """Обновляет счётчики per-doc/page/lang и бюджет токенов для принятого кандидата."""
+        nonlocal used_tokens
+        try:
+            cid = cand.get("chunk_id")
+            meta = chunks_metadata[int(cid)] if isinstance(cid, (int, np.integer)) and 0 <= int(cid) < len(chunks_metadata) else {}
+            src = str(meta.get("source")) if meta else None
+            pg = int(meta.get("page")) if meta and isinstance(meta.get("page"), int) else None
+            lang = meta.get("lang") if meta else None
+            if src is not None:
+                per_doc_count[src] = per_doc_count.get(src, 0) + 1
+            if (not ignore_per_page_cap) and int(PER_PAGE_CAP) > 0 and src is not None and pg is not None:
+                per_page_count[(src, pg)] = per_page_count.get((src, pg), 0) + 1
+            if isinstance(lang, str) and lang in lang_count:
+                lang_count[lang] = lang_count.get(lang, 0) + 1
+            used_tokens += _estimate_tokens(meta.get("text") if isinstance(meta, dict) else None, lang)
+        except Exception:
+            pass
+
+    def passes_dedup(cand: Dict[str, Any]) -> tuple[bool, str]:
+        """Проверка A (по символам) и B (по эмбеддингам) для дедупликации."""
+        try:
+            cid = cand.get("chunk_id")
+            if not isinstance(cid, (int, np.integer)):
+                return (False, "bad_chunk_id")
+            meta = chunks_metadata[int(cid)] if 0 <= int(cid) < len(chunks_metadata) else None
+            if not isinstance(meta, dict):
+                return (True, "ok")
+            src = meta.get("source")
+            pg = meta.get("page")
+            c0 = int(meta.get("char_start", 0))
+            c1 = int(meta.get("char_end", 0))
+            # A. По символам в рамках одной страницы и источника
+            for sel in selected:
+                sid = sel.get("chunk_id")
+                if not isinstance(sid, (int, np.integer)):
+                    continue
+                sm = chunks_metadata[int(sid)] if 0 <= int(sid) < len(chunks_metadata) else None
+                if not isinstance(sm, dict):
+                    continue
+                if sm.get("source") == src and sm.get("page") == pg:
+                    s0 = int(sm.get("char_start", 0))
+                    s1 = int(sm.get("char_end", 0))
+                    iou = _compute_char_iou(c0, c1, s0, s1)
+                    if iou >= float(DUP_CHAR_IOU_THRESHOLD):
+                        return (False, f"dup_char_iou={iou:.2f}")
+            # B. По эмбеддингам: cos к уже выбранным
+            try:
+                cand_vec = _get_candidate_vec(cand)
+                max_cos = 0.0
+                for sel in selected:
+                    sel_vec = _get_candidate_vec(sel)
+                    max_cos = max(max_cos, _cosine_sim(cand_vec, sel_vec))
+                    if max_cos >= float(effective_dup_emb_cos_threshold):
+                        return (False, f"dup_cos={max_cos:.2f}")
+            except Exception:
+                # Если не смогли получить вектор, не блокируем по косинусу
+                pass
+            return (True, "ok")
+        except Exception:
+            return (True, "ok")
+
+    def passes_quotas_and_budget(cand: Dict[str, Any]) -> tuple[bool, str]:
+        """Проверка квот per-doc, per-page, языковых минимумов и бюджета токенов.
+
+        Логика языковых квот: перед каждым выбором оцениваем, сколько слотов осталось и
+        какие минимальные квоты ещё не покрыты. Если слот последний(е) и есть непокрытая
+        квота по языку, у кандидата с иным языком снижаем приоритет/отклоняем.
+        """
+        try:
+            cid = cand.get("chunk_id")
+            meta = chunks_metadata[int(cid)] if isinstance(cid, (int, np.integer)) and 0 <= int(cid) < len(chunks_metadata) else {}
+            src = str(meta.get("source")) if meta else None
+            pg = int(meta.get("page")) if meta and isinstance(meta.get("page"), int) else None
+            lang = meta.get("lang") if meta else None
+            # per-doc
+            if src is not None and per_doc_count.get(src, 0) >= int(PER_DOC_CAP):
+                return (False, "doc_cap")
+            # per-page
+            if (not ignore_per_page_cap) and int(PER_PAGE_CAP) > 0 and src is not None and pg is not None and per_page_count.get((src, pg), 0) >= int(PER_PAGE_CAP):
+                return (False, "page_cap")
+            # бюджет токенов (оценка)
+            text = meta.get("text") if isinstance(meta, dict) else None
+            need_tokens = _estimate_tokens(text, lang)
+            if used_tokens + need_tokens > int(CONTEXT_TOKENS_BUDGET):
+                return (False, "budget")
+            # языковые минимальные квоты: оставшиеся слоты и квоты
+            remaining_slots = int(CONTEXT_TOP_K) - len(selected)
+            # Считаем, какие квоты ещё не покрыты
+            remaining_lang_quota: Dict[str, int] = {}
+            for lk, min_need in LANG_MIN_COVER.items():
+                try:
+                    min_need_int = int(min_need)
+                except Exception:
+                    min_need_int = 0
+                covered = lang_count.get(lk, 0)
+                if covered < min_need_int:
+                    remaining_lang_quota[lk] = (min_need_int - covered)
+            total_remaining_quota = sum(remaining_lang_quota.values())
+            # Если осталось мало слотов и ещё есть обязательные языки, даём приоритет нужному языку
+            if (not ignore_lang_min_cover) and total_remaining_quota > 0 and remaining_slots <= total_remaining_quota:
+                # Если текущий кандидат не относится к одному из обязательных ещё языков — отклоняем
+                if not (isinstance(lang, str) and lang in remaining_lang_quota and remaining_lang_quota[lang] > 0):
+                    return (False, "lang_quota")
+            # Мягкая проверка языковых минимумов: стараемся удовлетворить LANG_MIN_COVER
+            # (жёстко не отклоняем, если другие ограничения критичнее)
+            return (True, "ok")
+        except Exception:
+            return (True, "ok")
+
+    # Предвычислим вектора для пулла один раз
+    pool_vecs: Dict[int, np.ndarray] = {}
+    for cand in pool:
+        try:
+            pool_vecs[id(cand)] = _get_candidate_vec(cand)
+        except Exception:
+            pass
+
+    # Жадный MMR-отбор
+    decline_counter = 0
+    while len(selected) < int(CONTEXT_TOP_K) and pool:
+        # Оценка score для каждого кандидата пула
+        scores_local = []
+        for cand in pool:
+            cand_vec = pool_vecs.get(id(cand))
+            if cand_vec is None:
+                try:
+                    cand_vec = _get_candidate_vec(cand)
+                    pool_vecs[id(cand)] = cand_vec
+                except Exception:
+                    # Если нет вектора — ставим минимальный скор, пусть уйдет в конец
+                    scores_local.append((-1e9, cand, 0.0, 0.0))
+                    continue
+            rel = _cosine_sim(q_vec, cand_vec)
+            div = 0.0
+            for sel in selected:
+                sel_vec = pool_vecs.get(id(sel))
+                if sel_vec is None:
+                    try:
+                        sel_vec = _get_candidate_vec(sel)
+                        pool_vecs[id(sel)] = sel_vec
+                    except Exception:
+                        continue
+                div = max(div, _cosine_sim(cand_vec, sel_vec))
+            score = float(MMR_LAMBDA) * rel - float(1.0 - float(MMR_LAMBDA)) * div
+            scores_local.append((score, cand, rel, div))
+        # Выбираем лучший по score
+        scores_local.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_cand, best_rel, best_div = scores_local[0]
+
+        ok_dedup, reason_dedup = passes_dedup(best_cand)
+        ok_quota, reason_quota = passes_quotas_and_budget(best_cand)
+        if ok_dedup and ok_quota:
+            # Принять
+            try:
+                # Сохраняем метрики MMR в кандидате
+                best_cand["mmr_score"] = float(best_score)
+                best_cand["mmr_rel"] = float(best_rel)
+                best_cand["mmr_div"] = float(best_div)
+            except Exception:
+                pass
+            selected.append(best_cand)
+            _on_accept(best_cand)
+        else:
+            # Отклонить с причиной
+            rej_reason = reason_dedup if not ok_dedup else reason_quota
+            rejected.append({"candidate": best_cand, "reason": rej_reason, "score": float(best_score)})
+            decline_counter += 1
+
+        # Удалить рассмотренного из пула
+        pool = [c for c in pool if c is not best_cand]
+
+        # Ослабление порогов при большом числе отказов (простейшая эвристика)
+        if decline_counter >= 3 and (len(selected) < int(CONTEXT_TOP_K) // 2):
+            # Ослабляем дедуп по эмбеддингам внутри прохода: повышаем порог, чтобы допускать более похожие
+            try:
+                effective_dup_emb_cos_threshold = float(min(float(RELAX_DUP_EMB_COS_MAX), float(effective_dup_emb_cos_threshold) + float(RELAX_DUP_EMB_COS_STEP)))
+                # Учесть шаг ослабления
+                try:
+                    relax_info["dup_cos_steps"] = int(relax_info.get("dup_cos_steps", 0)) + 1
+                except Exception:
+                    relax_info["dup_cos_steps"] = 1
+                decline_counter = 0
+            except Exception:
+                pass
+
+    # Стратегия "ослабления", если контекст не набран
+    relax_info = {
+        "dup_cos_threshold": float(effective_dup_emb_cos_threshold),
+        "ignore_per_page": bool(False),
+        "ignore_lang_cover": bool(ignore_lang_min_cover),
+        "fallback_tail_used": bool(False),
+        "dup_cos_steps": int(0),
+    }
+
+    def _attempt_fill() -> int:
+        """Пытается добрать кандидатов из текущего пула с текущими ограничениями."""
+        nonlocal pool
+        added = 0
+        while len(selected) < int(CONTEXT_TOP_K) and pool:
+            # Пересчитываем скор MMR для оставшегося пула
+            scores_local = []
+            for cand in pool:
+                cand_vec = pool_vecs.get(id(cand))
+                if cand_vec is None:
+                    try:
+                        cand_vec = _get_candidate_vec(cand)
+                        pool_vecs[id(cand)] = cand_vec
+                    except Exception:
+                        scores_local.append((-1e9, cand, 0.0, 0.0))
+                        continue
+                rel = _cosine_sim(q_vec, cand_vec)
+                div = 0.0
+                for sel in selected:
+                    sel_vec = pool_vecs.get(id(sel))
+                    if sel_vec is None:
+                        try:
+                            sel_vec = _get_candidate_vec(sel)
+                            pool_vecs[id(sel)] = sel_vec
+                        except Exception:
+                            continue
+                    div = max(div, _cosine_sim(cand_vec, sel_vec))
+                score = float(MMR_LAMBDA) * rel - float(1.0 - float(MMR_LAMBDA)) * div
+                scores_local.append((score, cand, rel, div))
+            if not scores_local:
+                break
+            scores_local.sort(key=lambda x: x[0], reverse=True)
+
+            accepted_in_round = False
+            for sc, cand, rel, div in scores_local:
+                ok_dedup, reason_dedup = passes_dedup(cand)
+                ok_quota, reason_quota = passes_quotas_and_budget(cand)
+                if ok_dedup and ok_quota:
+                    try:
+                        cand["mmr_score"] = float(sc)
+                        cand["mmr_rel"] = float(rel)
+                        cand["mmr_div"] = float(div)
+                    except Exception:
+                        pass
+                    selected.append(cand)
+                    _on_accept(cand)
+                    pool = [c for c in pool if c is not cand]
+                    added += 1
+                    accepted_in_round = True
+                    break
+                else:
+                    rejected.append({"candidate": cand, "reason": reason_dedup if not ok_dedup else reason_quota, "score": float(sc)})
+                    pool = [c for c in pool if c is not cand]
+            if not accepted_in_round:
+                break
+        return added
+
+    if len(selected) < int(CONTEXT_TOP_K):
+        # 1) Повышаем порог дедупликации по эмбеддингам ступенчато до RELAX_DUP_EMB_COS_MAX
+        progressed = True
+        while progressed and len(selected) < int(CONTEXT_TOP_K) and effective_dup_emb_cos_threshold < float(RELAX_DUP_EMB_COS_MAX):
+            try:
+                effective_dup_emb_cos_threshold = float(min(float(RELAX_DUP_EMB_COS_MAX), float(effective_dup_emb_cos_threshold) + float(RELAX_DUP_EMB_COS_STEP)))
+                relax_info["dup_cos_threshold"] = float(effective_dup_emb_cos_threshold)
+                relax_info["dup_cos_steps"] = int(relax_info.get("dup_cos_steps", 0)) + 1
+            except Exception:
+                break
+            added_now = _attempt_fill()
+            progressed = added_now > 0
+
+    if len(selected) < int(CONTEXT_TOP_K):
+        # 2) Снимаем ограничение per-page (оставляем только per-doc)
+        ignore_per_page_cap = True
+        relax_info["ignore_per_page"] = True
+        _attempt_fill()
+
+    if len(selected) < int(CONTEXT_TOP_K):
+        # 3) Игнорируем языковые минимальные квоты
+        ignore_lang_min_cover = True
+        relax_info["ignore_lang_cover"] = True
+        _attempt_fill()
+
+    if len(selected) < int(CONTEXT_TOP_K):
+        # 4) Добор из хвоста реранка без MMR/фильтров
+        seen_ids = {int(c.get("chunk_id")) for c in selected if isinstance(c.get("chunk_id"), (int, np.integer))}
+        fallback_added = 0
+        for cand in reranked_top:
+            if len(selected) >= int(CONTEXT_TOP_K):
+                break
+            cid = cand.get("chunk_id")
+            if isinstance(cid, (int, np.integer)) and int(cid) not in seen_ids:
+                selected.append(cand)
+                _on_accept(cand)
+                seen_ids.add(int(cid))
+                fallback_added += 1
+        relax_info["fallback_tail_used"] = bool(fallback_added > 0)
+
+    debug = {
+        "used_tokens": int(used_tokens),
+        "per_doc": per_doc_count,
+        "per_page": {f"{k[0]}:p{k[1]}": v for k, v in per_page_count.items()},
+        "lang_count": lang_count,
+        "pool_initial": min(MMR_POOL_K, len(reranked_top)),
+        "selected": len(selected),
+        "rejected": len(rejected),
+        "relax": relax_info,
+    }
+    return {"selected": selected, "rejected": rejected, "debug": debug}
 
 
 # ---------------------------
@@ -1150,3 +1873,128 @@ def _load_api_key_from_env() -> str:
     if not key:
         raise RuntimeError("OPENROUTER_API_KEY не найден в .env файле.")
     return key
+
+
+def build_generation_prompt(
+    question: str,
+    context_pack: List[Dict[str, Any]],
+    sources_map: Dict[str, int],
+    target_lang: str,
+) -> List[Dict[str, str]]:
+    """Собирает сообщения для Chat Completions с жёсткими правилами и источниками.
+
+    Правила:
+    - Отвечать только на языке target_lang ('ru' или 'en').
+    - Использовать исключительно информацию из раздела «Источники» (S1…Sn).
+    - Каждый ключевой тезис должен иметь ссылку [S#] на соответствующий источник.
+    - При недостатке сведений начинать ответ строкой: "Недостаточно данных" и явно перечислять, чего не хватает.
+    - Не добавлять внешние сведения, не пытаться угадывать.
+    - Если вопрос вне контекста источников, так и указать, без использования «общих знаний».
+
+    Формат ответа:
+    - Короткий «вывод» (2–4 предложения).
+    - Далее структурированный разбор списком (каждый пункт с [S#]).
+    - В конце раздел «Ссылки» — список S# → {source}, p.{page}.
+    """
+    tl = target_lang if target_lang in {"ru", "en"} else "ru"
+
+    def _shrink_text(text: Any, limit: int) -> str:
+        if not isinstance(text, str):
+            return ""
+        if len(text) <= int(limit):
+            return text
+        return (text[: int(limit)].rstrip() + "…")
+
+    sources_lines: List[str] = []
+    for idx, item in enumerate(context_pack or []):
+        label = f"S{idx+1}"
+        cid = item.get("chunk_id")
+        src = item.get("source")
+        pg = item.get("page")
+        c0 = None
+        c1 = None
+        try:
+            if isinstance(cid, (int, np.integer)) and 0 <= int(cid) < len(chunks_metadata):
+                meta = chunks_metadata[int(cid)]
+                if src is None:
+                    src = meta.get("source")
+                if pg is None:
+                    pg = meta.get("page")
+                c0 = meta.get("char_start")
+                c1 = meta.get("char_end")
+        except Exception:
+            pass
+        header = f"{label} — {src}, p.{pg}"
+        if isinstance(c0, int) and isinstance(c1, int):
+            header = f"{header} ({c0}–{c1})"
+        snippet = item.get("text_ref")
+        if not isinstance(snippet, str):
+            try:
+                if isinstance(cid, (int, np.integer)) and 0 <= int(cid) < len(chunks_metadata):
+                    snippet = chunks_metadata[int(cid)].get("text")
+            except Exception:
+                snippet = ""
+        snippet = _shrink_text(snippet, int(SNIPPET_MAX_CHARS))
+        sources_lines.append(f"{header}\n{snippet}")
+
+    system_content = (
+        f"Отвечай только на языке: {tl}.\n"
+        "Не вставляй текст на других языках.\n"
+        "Используй исключительно информацию из раздела «Источники».\n"
+        "Каждый ключевой тезис помечай ссылкой [S#] — номер из списка «Источники».\n"
+        "Если сведений недостаточно — начни ответ строкой: \"Недостаточно данных\" и перечисли, чего именно не хватает.\n"
+        "Не добавляй внешние сведения и не пытайся угадывать.\n"
+        "Если вопрос вне контекста источников — так и скажи, без «общих знаний».\n"
+        "Не вставляй длинные прямые цитаты из источников; перефразируй, добавив [S#]. Допускаются короткие цитаты ≤ "
+        f"{int(MAX_QUOTE_WORDS)} слов при необходимости.\n\n"
+        "Формат ответа:\n"
+        "1) Короткий «вывод» (2–4 предложения).\n"
+        "2) Структурированный разбор списком; у каждого пункта укажи [S#].\n"
+        "3) Раздел «Ссылки» — список S# → {source}, p.{page}.\n"
+        "Важно: именно ты должен проставлять [S#] в тексте ответа."
+    )
+
+    user_content = (
+        f"Вопрос:\n{question}\n\n"
+        "Источники:\n" + ("\n\n".join(sources_lines) if sources_lines else "(нет контекста)")
+    )
+
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]
+
+# ---------------------------
+# Пост-обработка ответа LLM
+# ---------------------------
+
+def _language_ratio_simple(text: str, target_lang: str) -> float:
+    """Оценка доли символов целевого языка.
+
+    Для 'ru' — доля кириллических букв среди всех букв; для 'en' — доля латиницы.
+    Возвращает значение в диапазоне [0,1].
+    """
+    if not isinstance(text, str) or not text:
+        return 0.0
+    letters = [ch for ch in text if ch.isalpha()]
+    if not letters:
+        return 0.0
+    if target_lang == 'ru':
+        target_count = sum(1 for ch in letters if 'А' <= ch <= 'я' or ch in ('Ё', 'ё'))
+    elif target_lang == 'en':
+        target_count = sum(1 for ch in letters if ('A' <= ch <= 'Z') or ('a' <= ch <= 'z'))
+    else:
+        target_count = 0
+    return float(target_count) / float(len(letters))
+
+def _extract_used_sources(text: str, valid_labels: List[str]) -> List[str]:
+    """Достаёт из текста маркеры ссылок вида [S\d+] и фильтрует по valid_labels."""
+    if not isinstance(text, str) or not text:
+        return []
+    try:
+        ids = re.findall(r"\[S(\d+)\]", text)
+        labels = [f"S{int(x)}" for x in ids]
+        uniq = sorted({lab for lab in labels if lab in set(valid_labels)}, key=lambda s: int(s[1:]))
+        return uniq
+    except Exception:
+        return []

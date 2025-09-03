@@ -202,6 +202,7 @@ def build_candidate_dict(chunk_global_id: int, retrieval_label: str, rank: int, 
         "chunk_index": meta.get("chunk_index"),
         "page": meta.get("page") if isinstance(meta, dict) and "page" in meta else None,
         "text_ref": meta.get("text"),
+        "citation": format_citation(meta),
         "retrieval": retrieval_label,
         "rank": int(rank),
         "score_raw": float(score_raw),
@@ -408,6 +409,11 @@ def fuse_candidates_rrf(cands_by_branch: Dict[str, List[Dict[str, Any]]]) -> Lis
                     "chunk_index": item.get("chunk_index"),
                     "page": item.get("page"),
                     "text_ref": item.get("text_ref"),
+                    "citation": item.get("citation") or format_citation({
+                        "source": item.get("source"),
+                        "chunk_index": item.get("chunk_index"),
+                        "page": item.get("page")
+                    }),
                     "fusion_score": score,
                     "min_rank": rank_int,
                     "hits": [branch],
@@ -506,38 +512,62 @@ def initialize_models():
 def ensure_dir(path: str):
     Path(path).mkdir(parents=True, exist_ok=True)
 
+def format_citation(meta: Dict[str, Any]) -> str:
+    """Форматирует ссылку на источник из метаданных чанка.
+
+    Приоритеты:
+    - Если заданы page, char_start, char_end: "[source p.page char_start–char_end]"
+    - Если задан page: "[source p.page]"
+    - Иначе fallback: "[source:chunk_index]"
+    """
+    source = meta.get("source")
+    page = meta.get("page")
+    c0 = meta.get("char_start")
+    c1 = meta.get("char_end")
+    if isinstance(page, int) and page > 0:
+        if isinstance(c0, int) and isinstance(c1, int):
+            return f"[{source} p.{page} {c0}–{c1}]"
+        return f"[{source} p.{page}]"
+    return f"[{source}:{meta.get('chunk_index')}]"
+
 # ---------------------------
 # PDF Loading & Text Extraction
 # ---------------------------
 
-def extract_text_from_pdf(pdf_path: str) -> str:
+def extract_text_from_pdf(pdf_path: str) -> List[Dict[str, Any]]:
     """
-    Извлекает структурированный текст из PDF в markdown с сохранением форматирования,
-    используя LangChain Docling loader.
+    Извлекает текст PDF постранично.
+
+    Возвращает список словарей вида: [{"page": 1, "text": "..."}, ..., {"page": N, "text": "..."}].
+    Текст берётся из Docling, нумерация страниц — по порядку элементов (fallback для несоответствий метаданных).
     """
     try:
         loader = DoclingLoader(file_path=[pdf_path])
         docs = loader.load()
         if not docs:
-            return ""
-        text = "\n\n".join(d.page_content for d in docs if d.page_content and d.page_content.strip())
-        return text.strip()
+            return []
+        page_texts = [d.page_content for d in docs if d.page_content and d.page_content.strip()]
+        pages = []
+        for i, t in enumerate(page_texts, start=1):
+            # Не изменяем содержимое страницы (без strip), только фильтрация пустых
+            pages.append({"page": i, "text": t})
+        return pages
     except Exception:
-        return ""
+        return []
 
 
-def load_pdfs_from_directory(directory: str) -> Dict[str, str]:
+def load_pdfs_from_directory(directory: str) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Loads all PDFs from the directory, extracts text.
-    Returns dict: {filename: text}
+    Загружает все PDF из директории и извлекает текст постранично.
+    Возвращает словарь: {filename: [{"page": i, "text": "..."}, ...]}.
     """
     pdf_files = glob.glob(os.path.join(directory, "*.pdf"))
-    docs = {}
+    docs: Dict[str, List[Dict[str, Any]]] = {}
     for p in pdf_files:
         filename = os.path.basename(p)
-        text = extract_text_from_pdf(p)
-        if text.strip():
-            docs[filename] = text
+        pages = extract_text_from_pdf(p)
+        if isinstance(pages, list) and len(pages) > 0:
+            docs[filename] = pages
     return docs
 
 
@@ -557,8 +587,8 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
         separators=["\n\n", "\n", ". ", ", ", " ", ""],
     )
     chunks = text_splitter.split_text(text)
-    # Отфильтровываем слишком короткие/пустые чанки
-    chunks = [c.strip() for c in chunks if len(c.strip()) > 20]
+    # Не модифицируем содержимое чанков; только фильтрация по длине
+    chunks = [c for c in chunks if isinstance(c, str) and len(c.strip()) > 20]
     return chunks
 
  
@@ -615,12 +645,45 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
 
     all_chunks_text, chunks_metadata = [], []
     doc_counter = 0
-    for filename, text in docs.items():
-        raw_chunks = chunk_text(text)
-        for i, c_text in enumerate(raw_chunks):
-            chunks_metadata.append({"source": filename, "chunk_index": doc_counter, "text": c_text})
-            all_chunks_text.append(c_text)
-            doc_counter += 1
+    for filename, pages in docs.items():
+        if not isinstance(pages, list):
+            continue
+        for page_entry in pages:
+            page_num = page_entry.get("page")
+            page_text = page_entry.get("text", "")
+            if not isinstance(page_text, str) or not page_text.strip():
+                continue
+            raw_chunks = chunk_text(page_text)
+            # Инкрементальный курсор по странице для корректной привязки смещений
+            cursor = 0
+            page_len = len(page_text)
+            for c_text in raw_chunks:
+                if not isinstance(c_text, str):
+                    continue
+                if len(c_text) == 0:
+                    continue
+                # Реальные координаты чанка: ищем подстроку, начиная с cursor
+                start_idx = page_text.find(c_text, cursor) if page_len > 0 else -1
+                if start_idx < 0:
+                    # Фолбэк: попробуем найти с начала страницы
+                    start_idx = page_text.find(c_text) if page_len > 0 else -1
+                if start_idx < 0:
+                    # Если не нашли, используем безопасный минимум
+                    start_idx = max(0, min(cursor, max(0, page_len - 1)))
+                end_idx = start_idx + len(c_text) - 1 if page_len > 0 else 0
+                chunks_metadata.append({
+                    "source": filename,
+                    "chunk_index": doc_counter,
+                    "text": c_text,
+                    "page": int(page_num) if isinstance(page_num, int) and page_num > 0 else 1,
+                    "char_start": int(start_idx),
+                    "char_end": int(end_idx),
+                })
+                all_chunks_text.append(c_text)
+                # Шаг курсора: длина чанка минус overlap; гарантируем прогресс минимум на 1
+                step = max(1, len(c_text) - CHUNK_OVERLAP)
+                cursor = start_idx + step
+                doc_counter += 1
             
     # Создание Dense (векторного) индекса с распределением по нескольким GPU
     embeddings = _encode_multi_gpu(all_chunks_text, batch_size=EMBED_BATCH_SIZE, gpu_ids=EMBED_GPU_IDS)

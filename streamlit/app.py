@@ -138,6 +138,15 @@ if prompt := st.chat_input("Ваш вопрос..."):
                     # Краткая сводка
                     st.markdown(f"**Сводка:** {{'fused': {len(fused)}, 'reranked': {len(reranked)}}}")
 
+                    # Вспомогательная функция построения якоря для будущего просмотра PDF
+                    def _make_anchor(item: dict) -> str:
+                        """Строит якорь вида ?file={source}&page={page} для навигации."""
+                        src = item.get("source")
+                        pg = item.get("page")
+                        if src and isinstance(pg, int):
+                            return f"?file={src}&page={pg}"
+                        return ""
+
                     # Блок RRF-слияние (top-20)
                     with st.expander("RRF-слияние (top-20)"):
                         rows_fused = [
@@ -147,6 +156,8 @@ if prompt := st.chat_input("Ваш вопрос..."):
                                 "hits": it.get("hits"),
                                 "source": it.get("source"),
                                 "page": it.get("page"),
+                                "citation": it.get("citation"),
+                                "anchor": _make_anchor(it),
                             }
                             for it in fused[:20]
                         ]
@@ -159,7 +170,9 @@ if prompt := st.chat_input("Ваш вопрос..."):
                                 "rerank_score": it.get("rerank_score"),
                                 "source": it.get("source"),
                                 "page": it.get("page"),
+                                "citation": it.get("citation"),
                                 "retrieval_hits": it.get("hits"),
+                                "anchor": _make_anchor(it),
                             }
                             for it in reranked[:5]
                         ]

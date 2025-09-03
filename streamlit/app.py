@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 # Импортируем обновленные функции
 from rag_core import build_and_load_knowledge_base, create_rag_chain, _load_api_key_from_env, hybrid_search_with_rerank
+import rag_core as rc
 
 # --- Конфигурация страницы ---
 st.set_page_config(
@@ -55,6 +56,23 @@ with st.sidebar:
     process_button = st.button("Обработать документы", type="primary")
     st.divider()
     lang_filter_flag = st.checkbox("Language filter ON", value=True, help="Включить приоритизацию кандидатов по языку (SAME_LANG_RATIO)")
+
+    # Переключатель Recall level: переопределяем базовый efSearch на сессию
+    recall_options = {
+        "Fast (ef=64)": 64,
+        "Balanced (ef=128)": 128,
+        "High (ef=256)": 256,
+        "Max (ef=384)": 384,
+    }
+    recall_labels = list(recall_options.keys())
+    default_recall_label = st.session_state.get("recall_label", "Balanced (ef=128)")
+    try:
+        default_idx = recall_labels.index(default_recall_label)
+    except ValueError:
+        default_idx = 1
+    recall_label = st.selectbox("Recall level", recall_labels, index=default_idx, help="Контроль скорости/точности: базовый efSearch для HNSW")
+    st.session_state.recall_label = recall_label
+    rc.HNSW_EF_SEARCH_BASE = int(recall_options.get(recall_label, 128))
 
 # --- Основная логика ---
 # Базовая директория проекта (корень), независимо от текущей рабочей директории
@@ -182,6 +200,11 @@ if prompt := st.chat_input("Ваш вопрос..."):
                             for it in reranked[:5]
                         ]
                         st.dataframe(rows_rerank, use_container_width=True)
+
+                    # Отладка efSearch: показываем применённые значения (если включено)
+                    with st.expander("Диагностика efSearch"):
+                        st.write(f"Базовый efSearch (сессия): {rc.HNSW_EF_SEARCH_BASE}")
+                        st.caption("Применённый ef для каждой dense-ветки логируется при RAG_DEBUG=1 в серверный лог.")
 
                     # Показать языковые доли по веткам
                     with st.expander("Языковые доли по веткам"):

@@ -24,6 +24,7 @@ import requests
 from pathlib import Path
 from typing import List, Dict, Any
 import numpy as np
+import time
 from dotenv import load_dotenv
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
@@ -50,6 +51,33 @@ TOP_K_RETRIEVAL = 15
 TOP_K_FINAL = 5
 OPENROUTER_MODEL = "openai/gpt-oss-120b"
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+
+# Параметры FAISS HNSW (выведены из хардкода в конфигурацию)
+#
+# HNSW_M: степень графа при построении индекса
+# HNSW_EF_CONSTRUCTION: efConstruction при построении
+# HNSW_EF_SEARCH_BASE: базовый efSearch при поиске
+# HNSW_EF_SEARCH_PER_TOPK_MULT: множитель для динамического efSearch = max(BASE, MULT × top_k)
+# HNSW_USE_DYNAMIC_EF_SEARCH: флаг динамического efSearch на запрос
+# FAISS_CPU_THREADS: количество потоков FAISS на CPU (если None — не менять)
+HNSW_M = int(os.getenv("RAG_HNSW_M", "64"))
+HNSW_EF_CONSTRUCTION = int(os.getenv("RAG_HNSW_EF_CONSTRUCTION", "512"))
+HNSW_EF_SEARCH_BASE = int(os.getenv("RAG_HNSW_EF_SEARCH_BASE", "128"))
+HNSW_EF_SEARCH_PER_TOPK_MULT = int(os.getenv("RAG_HNSW_EF_SEARCH_PER_TOPK_MULT", "2"))
+HNSW_USE_DYNAMIC_EF_SEARCH = os.getenv("RAG_HNSW_USE_DYNAMIC_EF_SEARCH", "1") not in {"0", "false", "False"}
+HNSW_EF_SEARCH_MAX = int(os.getenv("RAG_HNSW_EF_SEARCH_MAX", "512"))
+HNSW_FAILSAFE_RATIO = float(os.getenv("RAG_HNSW_FAILSAFE_RATIO", "0.8"))
+HNSW_FAILSAFE_MAX_RETRY = int(os.getenv("RAG_HNSW_FAILSAFE_MAX_RETRY", "1"))
+_cpu_threads_env = os.getenv("RAG_FAISS_CPU_THREADS")
+# Если переменная не задана — используем число логических ядер, иначе приводим к int; явное "None" оставляет как есть
+FAISS_CPU_THREADS = (None if _cpu_threads_env in ("None", "none", "") else (int(_cpu_threads_env) if _cpu_threads_env is not None else mp.cpu_count()))
+
+# Применяем настройку потоков FAISS, если требуется
+try:
+    if FAISS_CPU_THREADS is not None:
+        faiss.omp_set_num_threads(int(FAISS_CPU_THREADS))
+except Exception:
+    pass
 
 # Параметры веточного ретрива (RU/EN)
 TOP_K_DENSE_BRANCH = 100
@@ -306,6 +334,18 @@ def collect_candidates_ru_en(question: str, k_dense: int = TOP_K_DENSE_BRANCH, k
     def _dense(query_text: str, label: str) -> List[Dict[str, Any]]:
         if k_dense_eff <= 0:
             return []
+        # Динамическая настройка efSearch по запросу (или базовое значение) с верхним ограничением
+        try:
+            if hasattr(faiss_index, "hnsw"):
+                need_topk = int(k_dense_eff)
+                ef_val = int(HNSW_EF_SEARCH_BASE)
+                if HNSW_USE_DYNAMIC_EF_SEARCH:
+                    ef_val = max(int(HNSW_EF_SEARCH_BASE), int(HNSW_EF_SEARCH_PER_TOPK_MULT) * need_topk)
+                ef_val = min(int(HNSW_EF_SEARCH_MAX), int(ef_val))
+                faiss_index.hnsw.efSearch = int(ef_val)
+                debug_log("[SEARCH] label=%s, k=%d, ef=%d", str(label), need_topk, int(ef_val))
+        except Exception:
+            pass
         q_emb = embedder.encode(
             sentences=[query_text],
             normalize_embeddings=True,
@@ -313,7 +353,23 @@ def collect_candidates_ru_en(question: str, k_dense: int = TOP_K_DENSE_BRANCH, k
             show_progress_bar=False,
         ).astype("float32")
         scores, indices = faiss_index.search(q_emb, k_dense_eff)
-        return build_candidates_from_arrays(list(indices[0]), list(scores[0]), label)
+        cands = build_candidates_from_arrays(list(indices[0]), list(scores[0]), label)
+        # Fail-safe эскалация: если вернулось существенно меньше, чем k, один раз удвоим ef и повторим
+        try:
+            if hasattr(faiss_index, "hnsw") and len(cands) < int(HNSW_FAILSAFE_RATIO * k_dense_eff):
+                retries = 0
+                while retries < int(HNSW_FAILSAFE_MAX_RETRY):
+                    new_ef = min(int(HNSW_EF_SEARCH_MAX), int(getattr(faiss_index.hnsw, 'efSearch', HNSW_EF_SEARCH_BASE)) * 2)
+                    faiss_index.hnsw.efSearch = int(new_ef)
+                    debug_log("[SEARCH_RETRY] label=%s, k=%d, retry=%d, ef=%d", str(label), int(k_dense_eff), retries + 1, int(new_ef))
+                    scores, indices = faiss_index.search(q_emb, k_dense_eff)
+                    cands = build_candidates_from_arrays(list(indices[0]), list(scores[0]), label)
+                    retries += 1
+                    if len(cands) >= int(HNSW_FAILSAFE_RATIO * k_dense_eff):
+                        break
+        except Exception:
+            pass
+        return cands
 
     def _bm25(query_text: str, label: str, lang_for_query: str | None) -> List[Dict[str, Any]]:
         if bm25_retriever is None or not bm25_corpus_ids:
@@ -630,6 +686,16 @@ def initialize_models():
 def ensure_dir(path: str):
     Path(path).mkdir(parents=True, exist_ok=True)
 
+def debug_log(message: str, *args: Any) -> None:
+    """Условное debug-логирование при RAG_DEBUG=1."""
+    if os.getenv("RAG_DEBUG") != "1":
+        return
+    try:
+        import logging
+        logging.getLogger(__name__).debug(message, *args)
+    except Exception:
+        pass
+
 def format_citation(meta: Dict[str, Any]) -> str:
     """Форматирует ссылку на источник из метаданных чанка.
 
@@ -775,10 +841,16 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
     bm25_loaded = False
     if os.path.exists(faiss_path) and os.path.exists(metadata_path) and os.path.isdir(bm25_dir):
         faiss_index = faiss.read_index(faiss_path)
-        # Обновляем параметр поиска HNSW после загрузки индекса
+        # Обновляем базовый параметр поиска HNSW после загрузки индекса
         try:
             if hasattr(faiss_index, "hnsw"):
-                faiss_index.hnsw.efSearch = 128
+                faiss_index.hnsw.efSearch = int(HNSW_EF_SEARCH_BASE)
+        except Exception:
+            pass
+        # Настройка потоков FAISS при загрузке
+        try:
+            if FAISS_CPU_THREADS is not None:
+                faiss.omp_set_num_threads(int(FAISS_CPU_THREADS))
         except Exception:
             pass
         with open(metadata_path, "rb") as f: chunks_metadata = pickle.load(f)
@@ -793,6 +865,15 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
             bm25_loaded = bool(bm25_corpus_ids)
         except Exception:
             bm25_loaded = False
+        # Санити-лог загрузки
+        try:
+            _ntotal = int(getattr(faiss_index, 'ntotal', 0)) if faiss_index is not None else 0
+            _meta = len(chunks_metadata)
+            _bm25 = len(bm25_corpus_ids)
+            _ef = int(getattr(getattr(faiss_index, 'hnsw', object()), 'efSearch', 0)) if faiss_index is not None else 0
+            debug_log("[INDEX_LOAD] ntotal=%d, metadata=%d, bm25_ids=%d, efSearch=%d, threads=%s", _ntotal, _meta, _bm25, _ef, (str(FAISS_CPU_THREADS) if FAISS_CPU_THREADS is not None else "default"))
+        except Exception:
+            pass
         if bm25_loaded:
             return True
 
@@ -869,14 +950,37 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
             
     # Создание Dense (векторного) индекса с распределением по нескольким GPU
     embeddings = _encode_multi_gpu(all_chunks_text, batch_size=EMBED_BATCH_SIZE, gpu_ids=EMBED_GPU_IDS)
+    # Гарантируем L2-нормализацию эмбеддингов для косинусной метрики (IP)
+    try:
+        faiss.normalize_L2(embeddings)
+    except Exception:
+        pass
     
     # --- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ ---
     # Используем быстрый HNSW-индекс вместо медленного IndexFlatIP
     dim = embeddings.shape[1]
-    M = 64
-    faiss_index = faiss.IndexHNSWFlat(dim, M, faiss.METRIC_INNER_PRODUCT)
-    faiss_index.hnsw.efSearch = 128
+    faiss_index = faiss.IndexHNSWFlat(dim, int(HNSW_M), faiss.METRIC_INNER_PRODUCT)
+    # Настройка параметров построения/поиска HNSW
+    try:
+        if hasattr(faiss_index, "hnsw"):
+            faiss_index.hnsw.efConstruction = int(HNSW_EF_CONSTRUCTION)
+            faiss_index.hnsw.efSearch = int(HNSW_EF_SEARCH_BASE)
+    except Exception:
+        pass
+    # Настраиваем потоки FAISS непосредственно перед построением
+    try:
+        if FAISS_CPU_THREADS is not None:
+            faiss.omp_set_num_threads(int(FAISS_CPU_THREADS))
+    except Exception:
+        pass
+    # Добавление эмбеддингов с измерением времени
+    _t0 = time.perf_counter()
     faiss_index.add(embeddings)
+    _elapsed_ms = (time.perf_counter() - _t0) * 1000.0
+    try:
+        debug_log("[INDEX_BUILD] dim=%d, M=%d, efConstruction=%d, add_time_ms=%.1f, ntotal=%d, threads=%s", int(dim), int(HNSW_M), int(HNSW_EF_CONSTRUCTION), float(_elapsed_ms), int(getattr(faiss_index, 'ntotal', 0)), (str(FAISS_CPU_THREADS) if FAISS_CPU_THREADS is not None else "default"))
+    except Exception:
+        pass
     faiss.write_index(faiss_index, faiss_path)
 
     # Построение BM25S sparse-индекса

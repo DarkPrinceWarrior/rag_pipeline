@@ -60,6 +60,47 @@ def chunk_text(text: str, chunk_size: int = rc.CHUNK_SIZE, overlap: int = rc.CHU
     return [c for c in chunks if isinstance(c, str) and len(c.strip()) > 20]
 
 
+def _encode_multi_gpu(texts: List[str], emb_path: str) -> np.ndarray:
+    """Кодирование эмбеддингов с шардированием и предвыделением memmap.
+
+    Алгоритм:
+    1) N=len(texts), D=размерность эмбеддинга из rc.embedder.
+    2) Создание memmap (npy): emb_mem shape=(N, D), dtype=float32.
+    3) Запуск стойких воркеров, диспетчеризация батчей как (global_start_idx, list_of_texts).
+    4) На ответе: O(1) запись по срезу emb_mem[start:start+B] = out.
+    5) drain_embed() и stop_embed_workers().
+    6) Возврат emb_mem.
+    """
+    n_texts = len(texts)
+    if n_texts == 0:
+        return np.zeros((0, 0), dtype="float32")
+
+    try:
+        emb_dim = int(getattr(rc.embedder, "get_sentence_embedding_dimension", lambda: None)())
+    except Exception:
+        emb_dim = None
+    if not isinstance(emb_dim, int) or emb_dim <= 0:
+        raise RuntimeError("Не удалось определить размерность эмбеддингов (emb_dim).")
+
+    emb_mem = np.memmap(emb_path, mode="w+", dtype="float32", shape=(n_texts, emb_dim))
+
+    start_embed_workers(rc.EMBED_GPU_IDS, rc.EMBEDDING_MODEL_NAME, rc.EMBED_MAX_LENGTH, rc.EMBED_BATCH_SIZE)
+    try:
+        for start_idx in range(0, n_texts, rc.EMBED_BATCH_SIZE):
+            batch = texts[start_idx:start_idx + rc.EMBED_BATCH_SIZE]
+            submit_embed((int(start_idx), batch))
+
+        results = drain_embed()
+        for start, arr in results:
+            if isinstance(arr, np.ndarray) and arr.size > 0:
+                bsz = int(arr.shape[0])
+                emb_mem[int(start):int(start) + bsz] = arr
+    finally:
+        stop_embed_workers()
+
+    return emb_mem
+
+
 def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: bool = False) -> bool:
     """Создаёт или загружает базу знаний: FAISS(HNSW) + BM25, матрицу эмбеддингов и метаданные."""
     initialize_models()
@@ -193,24 +234,8 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
                 cursor = start_idx + step
                 doc_counter += 1
 
-    # Эмбеддинги через слой стойких воркеров
-    start_embed_workers(rc.EMBED_GPU_IDS, rc.EMBEDDING_MODEL_NAME, rc.EMBED_MAX_LENGTH, rc.EMBED_BATCH_SIZE)
-    try:
-        # Отправка батчей заданий в воркеры
-        global_idx = 0
-        for batch in _chunk_iter(all_chunks_text, rc.EMBED_BATCH_SIZE):
-            submit_embed((global_idx, batch))
-            global_idx += len(batch)
-        # Сбор результатов и восстановление порядка по глобальному индексу
-        results = drain_embed()
-        results.sort(key=lambda x: int(x[0]))
-        parts = [emb for _, emb in results if isinstance(emb, np.ndarray) and emb.size > 0]
-        if parts:
-            embeddings = np.concatenate(parts, axis=0).astype('float32')
-        else:
-            embeddings = np.zeros((0, 0), dtype='float32')
-    finally:
-        stop_embed_workers()
+    # Эмбеддинги через стойких воркеров с предвыделением memmap и O(1) вставкой результатов
+    embeddings = _encode_multi_gpu(all_chunks_text, emb_path)
     try:
         faiss.normalize_L2(embeddings)
     except Exception:
@@ -263,9 +288,11 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
     with open(bm25_ids_path, "wb") as f:
         pickle.dump(rc.bm25_corpus_ids, f)
 
-    # Сохранение матрицы эмбеддингов
+    # Memmap уже на диске — гарантируем сброс на диск без повторного копирования
     try:
-        np.save(emb_path, embeddings.astype('float32'), allow_pickle=False)
+        flush_fn = getattr(embeddings, 'flush', None)
+        if callable(flush_fn):
+            flush_fn()
     except Exception:
         pass
 

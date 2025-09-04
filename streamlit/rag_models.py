@@ -25,9 +25,8 @@ def _chunk_iter(items: list[str], size: int) -> list[list[str]]:
 
 # Глобальное состояние воркеров
 _embed_workers: list[mp.Process] = []
-_embed_in_queues: list[mp.Queue] = []
+_embed_in_queue: mp.Queue | None = None
 _embed_out_queue: mp.Queue | None = None
-_embed_next_queue_idx: int = 0
 _embed_pending_jobs: int = 0
 
 
@@ -114,24 +113,23 @@ def start_embed_workers(devices: list[int], model_name: str, max_length: int, ba
     - один раз загружает эмбеддер в eval() и работает в режиме inference;
     - читает задания из своей очереди и отправляет результаты в общую out-очередь.
     """
-    global _embed_workers, _embed_in_queues, _embed_out_queue, _embed_next_queue_idx, _embed_pending_jobs
+    global _embed_workers, _embed_in_queue, _embed_out_queue, _embed_pending_jobs
     stop_embed_workers()
     if not isinstance(devices, list) or len(devices) == 0:
         _embed_workers = []
-        _embed_in_queues = []
+        _embed_in_queue = None
         _embed_out_queue = None
-        _embed_next_queue_idx = 0
         _embed_pending_jobs = 0
         return
     ctx = mp.get_context("spawn")
-    _embed_in_queues = [ctx.Queue(maxsize=64) for _ in devices]
-    _embed_out_queue = ctx.Queue(maxsize=64)
+    _embed_in_queue = ctx.Queue(maxsize=256)
+    _embed_out_queue = ctx.Queue(maxsize=256)
     _embed_workers = []
     for i, dev in enumerate(devices):
         p = ctx.Process(
             target=_embed_worker_main,
             args=(
-                _embed_in_queues[i],
+                _embed_in_queue,
                 _embed_out_queue,
                 int(dev),
                 str(model_name),
@@ -142,18 +140,15 @@ def start_embed_workers(devices: list[int], model_name: str, max_length: int, ba
         )
         p.start()
         _embed_workers.append(p)
-    _embed_next_queue_idx = 0
     _embed_pending_jobs = 0
 
 
 def submit_embed(job: tuple[int, list[str]]) -> None:
     """Ставит задание на кодирование: job=(global_start_idx, list_of_texts)."""
-    global _embed_next_queue_idx, _embed_pending_jobs
-    if not _embed_in_queues:
+    global _embed_pending_jobs
+    if _embed_in_queue is None:
         raise RuntimeError("Воркеры эмбеддингов не запущены: вызовите start_embed_workers().")
-    q = _embed_in_queues[_embed_next_queue_idx]
-    q.put(job)
-    _embed_next_queue_idx = (_embed_next_queue_idx + 1) % len(_embed_in_queues)
+    _embed_in_queue.put(job)
     _embed_pending_jobs += 1
 
 
@@ -172,11 +167,11 @@ def drain_embed() -> list[tuple[int, np.ndarray]]:
 
 def stop_embed_workers() -> None:
     """Останавливает воркеров и очищает ресурсы."""
-    global _embed_workers, _embed_in_queues, _embed_out_queue, _embed_next_queue_idx, _embed_pending_jobs
-    if _embed_in_queues:
-        for q in _embed_in_queues:
+    global _embed_workers, _embed_in_queue, _embed_out_queue, _embed_pending_jobs
+    if _embed_in_queue is not None and _embed_workers:
+        for _ in _embed_workers:
             try:
-                q.put(None)
+                _embed_in_queue.put(None)
             except Exception:
                 pass
     if _embed_workers:
@@ -186,9 +181,8 @@ def stop_embed_workers() -> None:
             except Exception:
                 pass
     _embed_workers = []
-    _embed_in_queues = []
+    _embed_in_queue = None
     _embed_out_queue = None
-    _embed_next_queue_idx = 0
     _embed_pending_jobs = 0
 
 

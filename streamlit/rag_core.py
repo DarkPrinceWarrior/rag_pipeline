@@ -114,6 +114,7 @@ EMBED_GPU_IDS: list[int] = _parse_gpu_ids(os.getenv("RAG_GPU_IDS_EMBED", "0,1"))
 RERANK_GPU_IDS: list[int] = _parse_gpu_ids(os.getenv("RAG_GPU_IDS_RERANK", "2"))
 RERANK_GPU_ID: int = RERANK_GPU_IDS[0]
 EMBED_BATCH_SIZE: int = int(os.getenv("RAG_EMBED_BATCH", "64"))
+EMBED_MAX_LENGTH: int = int(os.getenv("RAG_EMBED_MAX_LENGTH", "256"))
 
 # Рантайм-настройки генерации / перевода (устанавливаются в create_rag_chain)
 runtime_openrouter_api_key: str | None = None

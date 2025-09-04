@@ -15,7 +15,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from lingua import Language
 
 import rag_core as rc
-from rag_models import initialize_models, encode_multi_gpu
+from rag_models import initialize_models, start_embed_workers, submit_embed, drain_embed, stop_embed_workers
 from rag_pipeline import tokenize_text_by_lang  # DRY
 from rag_core import debug_log, ensure_dir
 
@@ -193,8 +193,24 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
                 cursor = start_idx + step
                 doc_counter += 1
 
-    # Эмбеддинги (мульти-GPU) + нормализация
-    embeddings = encode_multi_gpu(all_chunks_text, batch_size=rc.EMBED_BATCH_SIZE, gpu_ids=rc.EMBED_GPU_IDS)
+    # Эмбеддинги через слой стойких воркеров
+    start_embed_workers(rc.EMBED_GPU_IDS, rc.EMBEDDING_MODEL_NAME, rc.EMBED_MAX_LENGTH, rc.EMBED_BATCH_SIZE)
+    try:
+        # Отправка батчей заданий в воркеры
+        global_idx = 0
+        for batch in _chunk_iter(all_chunks_text, rc.EMBED_BATCH_SIZE):
+            submit_embed((global_idx, batch))
+            global_idx += len(batch)
+        # Сбор результатов и восстановление порядка по глобальному индексу
+        results = drain_embed()
+        results.sort(key=lambda x: int(x[0]))
+        parts = [emb for _, emb in results if isinstance(emb, np.ndarray) and emb.size > 0]
+        if parts:
+            embeddings = np.concatenate(parts, axis=0).astype('float32')
+        else:
+            embeddings = np.zeros((0, 0), dtype='float32')
+    finally:
+        stop_embed_workers()
     try:
         faiss.normalize_L2(embeddings)
     except Exception:

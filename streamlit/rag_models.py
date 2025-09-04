@@ -30,10 +30,23 @@ _embed_out_queue: mp.Queue | None = None
 _embed_pending_jobs: int = 0
 
 
+def _normalize_device_to_visible_token(device: int | str) -> str:
+    """Преобразует устройство (int, 'cuda:N' или UUID) в токен для CUDA_VISIBLE_DEVICES."""
+    try:
+        if isinstance(device, int):
+            return str(int(device))
+        s = str(device)
+        if s.startswith("cuda:"):
+            return s.split(":", 1)[1]
+        return s
+    except Exception:
+        return str(device)
+
+
 def _embed_worker_main(
     in_queue: mp.Queue,
     out_queue: mp.Queue,
-    device_id: int,
+    device_token: str,
     model_name: str,
     max_length: int,
     inner_batch_size: int,
@@ -43,7 +56,7 @@ def _embed_worker_main(
     Воркёр загружает модель один раз и обрабатывает задания из своей очереди.
     """
     # Настройки среды и CUDA
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(device_token)
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     try:
         import torch  # type: ignore
@@ -105,7 +118,7 @@ def _embed_worker_main(
                 pass
 
 
-def start_embed_workers(devices: list[int], model_name: str, max_length: int, batch_size: int) -> None:
+def start_embed_workers(devices: list[str | int], model_name: str, max_length: int, batch_size: int) -> None:
     """Запускает N GPU-воркеров по числу устройств.
 
     Каждый воркер:
@@ -126,12 +139,13 @@ def start_embed_workers(devices: list[int], model_name: str, max_length: int, ba
     _embed_out_queue = ctx.Queue(maxsize=256)
     _embed_workers = []
     for i, dev in enumerate(devices):
+        token = _normalize_device_to_visible_token(dev)
         p = ctx.Process(
             target=_embed_worker_main,
             args=(
                 _embed_in_queue,
                 _embed_out_queue,
-                int(dev),
+                str(token),
                 str(model_name),
                 int(max_length),
                 int(batch_size),

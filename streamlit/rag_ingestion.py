@@ -84,7 +84,7 @@ def _encode_multi_gpu(texts: List[str], emb_path: str) -> np.ndarray:
 
     emb_mem = np.memmap(emb_path, mode="w+", dtype="float32", shape=(n_texts, emb_dim))
 
-    start_embed_workers(rc.EMBED_GPU_IDS, rc.EMBEDDING_MODEL_NAME, rc.EMBED_MAX_LENGTH, rc.EMBED_BATCH_SIZE)
+    start_embed_workers(rc.EMBED_DEVICES, rc.EMBEDDING_MODEL_NAME, rc.EMBED_MAX_LENGTH_TOKENS, rc.EMBED_BATCH_SIZE)
     try:
         for start_idx in range(0, n_texts, rc.EMBED_BATCH_SIZE):
             batch = texts[start_idx:start_idx + rc.EMBED_BATCH_SIZE]

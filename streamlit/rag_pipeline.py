@@ -235,6 +235,9 @@ def collect_candidates_ru_en(question: str, k_dense: int = rc.TOP_K_DENSE_BRANCH
                 debug_log("[SEARCH] label=%s, k=%d, ef=%d", str(label), need_topk, int(ef_val))
         except Exception:
             pass
+        if rc.embedder is None:
+            from rag_models import initialize_models
+            initialize_models()
         q_emb = rc.embedder.encode(
             sentences=[query_text],
             normalize_embeddings=True,
@@ -613,6 +616,7 @@ def select_context_for_generation(question: str, reranked_top: List[Dict[str, An
         return {"selected": [], "rejected": [], "debug": {"reason": "empty_pool"}}
 
     if rc.embedder is None:
+        from rag_models import initialize_models
         initialize_models()
     q_vec = rc.embedder.encode([question], normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False).astype('float32')[0]
     q_vec = _l2_normalize(q_vec)

@@ -22,49 +22,80 @@ def _chunk_iter(items: list[str], size: int) -> list[list[str]]:
 def _worker_encode(args):
     """Воркер-процесс для мульти-GPU энкодинга эмбеддингов.
 
-    Параметры: (device_id, model_name, texts)
+    Параметры: (device_id, model_name, texts, batch_size)
     Возврат: np.ndarray float32 с L2-нормализацией на уровне модели.
     """
-    device_id, model_name, texts = args
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
+    device_id, model_name, texts, batch_size = args
     from sentence_transformers import SentenceTransformer as _ST  # локальный импорт
-    import torch  # type: ignore
 
-    torch.cuda.set_device(0)
-    model = _ST(model_name, trust_remote_code=True, device="cuda")
-    emb = model.encode(
-        sentences=texts,
-        show_progress_bar=False,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    ).astype("float32")
-    return emb
+    device = f"cuda:{int(device_id)}"
+    model = _ST(model_name, trust_remote_code=True, device=device)
+    batches = _chunk_iter(texts, int(batch_size))
+    outputs: list[np.ndarray] = []
+    for b in batches:
+        emb = model.encode(
+            sentences=b,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        ).astype("float32")
+        outputs.append(emb)
+    return np.concatenate(outputs, axis=0) if outputs else np.zeros((0, 0), dtype="float32")
 
 
 def encode_multi_gpu(texts: list[str], batch_size: int, gpu_ids: list[int]) -> np.ndarray:
-    """Распределённое кодирование эмбеддингов по нескольким GPU."""
+    """Распределённое кодирование эмбеддингов по нескольким GPU.
+
+    Алгоритм:
+    - Делим вход на равные по количеству чанки по числу доступных GPU.
+    - На каждый GPU запускается один процесс, который один раз загружает модель
+      на свой `cuda:{id}` и обрабатывает свой срез входа батчами.
+    Это гарантирует равномерное распределение памяти и отсутствие лавины на `cuda:0`.
+    """
     if not texts:
         return np.zeros((0, 0), dtype="float32")
-    batches = _chunk_iter(texts, batch_size)
+
+    num_gpus = max(1, len(gpu_ids))
+    # Равномерное разбиение входа по GPU
+    shard_sizes = [(len(texts) + i) // num_gpus for i in range(num_gpus)]
+    shards: list[list[str]] = []
+    start = 0
+    for sz in shard_sizes:
+        end = start + sz
+        shards.append(texts[start:end])
+        start = end
+
     tasks = []
-    for i, b in enumerate(batches):
-        device_id = gpu_ids[i % len(gpu_ids)]
-        tasks.append((device_id, rc.EMBEDDING_MODEL_NAME, b))
+    for i, shard in enumerate(shards):
+        if not shard:
+            continue
+        device_id = gpu_ids[i % num_gpus]
+        # Одна задача на один GPU: внутри задачи выполняется батчинг
+        tasks.append((device_id, rc.EMBEDDING_MODEL_NAME, shard, int(batch_size)))
+
+    if not tasks:
+        return np.zeros((0, 0), dtype="float32")
+
     from multiprocessing import Pool
-    with Pool(processes=min(len(tasks), len(gpu_ids))) as pool:
+    # Ровно по одному воркеру на задачу/GPU, чтобы каждая модель была загружена один раз
+    with Pool(processes=len(tasks)) as pool:
         results = pool.map(_worker_encode, tasks)
     return np.concatenate(results, axis=0)
 
 
-def initialize_models() -> None:
-    """Инициализация и кэширование моделей/инструментов в глобальном состоянии rc.*"""
-    if rc.embedder is None:
+def initialize_models(load_embedder: bool = True, load_reranker: bool = True) -> None:
+    """Инициализация и кэширование моделей/инструментов в глобальном состоянии rc.*
+
+    Аргументы управляют отложенной загрузкой крупных моделей для экономии GPU-памяти
+    в режимах, где они не требуются (например, при построении индекса).
+    """
+    if load_embedder and rc.embedder is None:
         rc.embedder = SentenceTransformer(
             rc.EMBEDDING_MODEL_NAME,
             trust_remote_code=True,
             device=f"cuda:{rc.EMBED_GPU_IDS[0]}",
         )
-    if rc.reranker is None:
+    if load_reranker and rc.reranker is None:
         try:
             import torch  # type: ignore
             has_cuda = bool(getattr(torch.cuda, "is_available", lambda: False)())

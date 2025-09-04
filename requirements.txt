@@ -22,3 +22,4 @@ jax[cuda12]
 FlagEmbedding
 accelerate
 stopwordsiso
+huggingface_hub[cli]

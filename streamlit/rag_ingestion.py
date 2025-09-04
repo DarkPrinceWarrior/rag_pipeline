@@ -62,7 +62,8 @@ def chunk_text(text: str, chunk_size: int = rc.CHUNK_SIZE, overlap: int = rc.CHU
 
 def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: bool = False) -> bool:
     """Создаёт или загружает базу знаний: FAISS(HNSW) + BM25, матрицу эмбеддингов и метаданные."""
-    initialize_models()
+    # Во время построения индекса не грузим лишние крупные модели на GPU
+    initialize_models(load_embedder=False, load_reranker=False)
 
     ensure_dir(index_dir)
     faiss_path = os.path.join(index_dir, "index.faiss")

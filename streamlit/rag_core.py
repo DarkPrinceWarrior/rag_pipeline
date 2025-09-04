@@ -8,6 +8,7 @@ from typing import Any
 # Минимальные ранние настройки среды (GPU/OMP/XLA)
 # -------------------------------------------------
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
@@ -26,7 +27,7 @@ if _xla_frac:
 BASE_DIR = Path(__file__).resolve().parents[1]
 PDF_DIR = str(BASE_DIR / "pdfs")
 VECTOR_STORE_PATH = str(BASE_DIR / "faiss_index")
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_MODEL_NAME = "google/embeddinggemma-300m"
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200

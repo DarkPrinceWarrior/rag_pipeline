@@ -98,22 +98,30 @@ RELAX_DUP_EMB_COS_STEP = float(os.getenv("RAG_RELAX_DUP_COS_STEP", "0.02"))
 RELAX_DUP_EMB_COS_MAX = float(os.getenv("RAG_RELAX_DUP_COS_MAX", "0.96"))
 
 # GPU настройки
-def _parse_gpu_ids(val: str) -> list[int]:
-    ids: list[int] = []
+def _parse_devices(val: str) -> list[str]:
+    devices: list[str] = []
     for part in (val or "").split(","):
         s = part.strip()
-        if not s:
-            continue
-        try:
-            ids.append(int(s))
-        except ValueError:
-            continue
-    return ids or [0]
+        if s:
+            devices.append(s)
+    return devices or ["cuda:0"]
 
-EMBED_GPU_IDS: list[int] = _parse_gpu_ids(os.getenv("RAG_GPU_IDS_EMBED", "0,1"))
-RERANK_GPU_IDS: list[int] = _parse_gpu_ids(os.getenv("RAG_GPU_IDS_RERANK", "2"))
-RERANK_GPU_ID: int = RERANK_GPU_IDS[0]
+
+def _device_to_id(dev: str) -> int:
+    try:
+        if ":" in dev:
+            return int(dev.split(":")[-1])
+        return int(dev)
+    except Exception:
+        return 0
+
+
+EMBED_DEVICES: list[str] = _parse_devices(os.getenv("RAG_EMBED_DEVICES", "cuda:0"))
+EMBED_GPU_IDS: list[int] = [_device_to_id(d) for d in EMBED_DEVICES]
+RERANK_DEVICE: str = os.getenv("RAG_RERANK_DEVICE", "cuda:0")
+RERANK_GPU_ID: int = _device_to_id(RERANK_DEVICE)
 EMBED_BATCH_SIZE: int = int(os.getenv("RAG_EMBED_BATCH", "64"))
+EMBED_MAX_LENGTH_TOKENS: int = int(os.getenv("RAG_EMBED_MAX_LENGTH_TOKENS", "1024"))
 
 # Рантайм-настройки генерации / перевода (устанавливаются в create_rag_chain)
 runtime_openrouter_api_key: str | None = None

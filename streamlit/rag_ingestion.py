@@ -15,7 +15,13 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from lingua import Language
 
 import rag_core as rc
-from rag_models import initialize_models, encode_multi_gpu
+from rag_models import (
+    initialize_models,
+    start_embed_workers,
+    submit_embed,
+    drain_embed,
+    stop_embed_workers,
+)
 from rag_pipeline import tokenize_text_by_lang  # DRY
 from rag_core import debug_log, ensure_dir
 
@@ -62,7 +68,7 @@ def chunk_text(text: str, chunk_size: int = rc.CHUNK_SIZE, overlap: int = rc.CHU
 
 def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: bool = False) -> bool:
     """Создаёт или загружает базу знаний: FAISS(HNSW) + BM25, матрицу эмбеддингов и метаданные."""
-    initialize_models()
+    initialize_models(load_embedder=False, load_reranker=False)
 
     ensure_dir(index_dir)
     faiss_path = os.path.join(index_dir, "index.faiss")
@@ -193,14 +199,26 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
                 cursor = start_idx + step
                 doc_counter += 1
 
-    # Эмбеддинги (мульти-GPU) + нормализация
-    embeddings = encode_multi_gpu(all_chunks_text, batch_size=rc.EMBED_BATCH_SIZE, gpu_ids=rc.EMBED_GPU_IDS)
+    # Эмбеддинги с постоянными воркерами
+    total = len(all_chunks_text)
+    from sentence_transformers import SentenceTransformer as _ST
+    dim = _ST(rc.EMBEDDING_MODEL_NAME, trust_remote_code=True, device="cpu").get_sentence_embedding_dimension()
+    emb_mem = np.lib.format.open_memmap(emb_path, mode="w+", dtype="float32", shape=(total, dim))
+    start_embed_workers(rc.EMBED_GPU_IDS, rc.EMBEDDING_MODEL_NAME, rc.EMBED_MAX_LENGTH_TOKENS, rc.EMBED_BATCH_SIZE)
+    for start in range(0, total, rc.EMBED_BATCH_SIZE):
+        batch = all_chunks_text[start:start + rc.EMBED_BATCH_SIZE]
+        submit_embed((start, batch))
+    for start_idx, emb in drain_embed():
+        emb_mem[start_idx:start_idx + emb.shape[0]] = emb
+    stop_embed_workers()
+    emb_mem.flush()
+    embeddings = np.asarray(emb_mem)
+    rc.EMB_MATRIX = embeddings
     try:
         faiss.normalize_L2(embeddings)
     except Exception:
         pass
 
-    dim = embeddings.shape[1]
     rc.faiss_index = faiss.IndexHNSWFlat(dim, int(rc.HNSW_M), faiss.METRIC_INNER_PRODUCT)
     try:
         if hasattr(rc.faiss_index, "hnsw"):
@@ -247,13 +265,10 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
     with open(bm25_ids_path, "wb") as f:
         pickle.dump(rc.bm25_corpus_ids, f)
 
-    # Сохранение матрицы эмбеддингов
-    try:
-        np.save(emb_path, embeddings.astype('float32'), allow_pickle=False)
-    except Exception:
-        pass
+    # Сохранение матрицы эмбеддингов уже выполнено через memmap
 
     with open(metadata_path, "wb") as f:
         pickle.dump(rc.chunks_metadata, f)
 
+    initialize_models()
     return True

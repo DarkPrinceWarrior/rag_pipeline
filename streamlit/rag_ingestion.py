@@ -15,7 +15,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from lingua import Language
 
 import rag_core as rc
-from rag_models import initialize_models, start_embed_workers, submit_embed, drain_embed, stop_embed_workers
+from rag_models import initialize_models, encode_multi_gpu
 from rag_pipeline import tokenize_text_by_lang  # DRY
 from rag_core import debug_log, ensure_dir
 
@@ -58,47 +58,6 @@ def chunk_text(text: str, chunk_size: int = rc.CHUNK_SIZE, overlap: int = rc.CHU
     )
     chunks = splitter.split_text(text)
     return [c for c in chunks if isinstance(c, str) and len(c.strip()) > 20]
-
-
-def _encode_multi_gpu(texts: List[str], emb_path: str) -> np.ndarray:
-    """Кодирование эмбеддингов с шардированием и предвыделением memmap.
-
-    Алгоритм:
-    1) N=len(texts), D=размерность эмбеддинга из rc.embedder.
-    2) Создание memmap (npy): emb_mem shape=(N, D), dtype=float32.
-    3) Запуск стойких воркеров, диспетчеризация батчей как (global_start_idx, list_of_texts).
-    4) На ответе: O(1) запись по срезу emb_mem[start:start+B] = out.
-    5) drain_embed() и stop_embed_workers().
-    6) Возврат emb_mem.
-    """
-    n_texts = len(texts)
-    if n_texts == 0:
-        return np.zeros((0, 0), dtype="float32")
-
-    try:
-        emb_dim = int(getattr(rc.embedder, "get_sentence_embedding_dimension", lambda: None)())
-    except Exception:
-        emb_dim = None
-    if not isinstance(emb_dim, int) or emb_dim <= 0:
-        raise RuntimeError("Не удалось определить размерность эмбеддингов (emb_dim).")
-
-    emb_mem = np.memmap(emb_path, mode="w+", dtype="float32", shape=(n_texts, emb_dim))
-
-    start_embed_workers(rc.EMBED_DEVICES, rc.EMBEDDING_MODEL_NAME, rc.EMBED_MAX_LENGTH_TOKENS, rc.EMBED_BATCH_SIZE)
-    try:
-        for start_idx in range(0, n_texts, rc.EMBED_BATCH_SIZE):
-            batch = texts[start_idx:start_idx + rc.EMBED_BATCH_SIZE]
-            submit_embed((int(start_idx), batch))
-
-        results = drain_embed()
-        for start, arr in results:
-            if isinstance(arr, np.ndarray) and arr.size > 0:
-                bsz = int(arr.shape[0])
-                emb_mem[int(start):int(start) + bsz] = arr
-    finally:
-        stop_embed_workers()
-
-    return emb_mem
 
 
 def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: bool = False) -> bool:
@@ -234,8 +193,8 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
                 cursor = start_idx + step
                 doc_counter += 1
 
-    # Эмбеддинги через стойких воркеров с предвыделением memmap и O(1) вставкой результатов
-    embeddings = _encode_multi_gpu(all_chunks_text, emb_path)
+    # Эмбеддинги (мульти-GPU) + нормализация
+    embeddings = encode_multi_gpu(all_chunks_text, batch_size=rc.EMBED_BATCH_SIZE, gpu_ids=rc.EMBED_GPU_IDS)
     try:
         faiss.normalize_L2(embeddings)
     except Exception:
@@ -288,11 +247,9 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
     with open(bm25_ids_path, "wb") as f:
         pickle.dump(rc.bm25_corpus_ids, f)
 
-    # Memmap уже на диске — гарантируем сброс на диск без повторного копирования
+    # Сохранение матрицы эмбеддингов
     try:
-        flush_fn = getattr(embeddings, 'flush', None)
-        if callable(flush_fn):
-            flush_fn()
+        np.save(emb_path, embeddings.astype('float32'), allow_pickle=False)
     except Exception:
         pass
 

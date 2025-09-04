@@ -110,54 +110,10 @@ def _parse_gpu_ids(val: str) -> list[int]:
             continue
     return ids or [0]
 
-def _parse_device_list(val: str) -> list[str]:
-    devs: list[str] = []
-    for part in (val or "").split(","):
-        s = part.strip()
-        if not s:
-            continue
-        devs.append(s)
-    return devs
-
-# Перечень устройств для эмбеддинга (индексация): по умолчанию cuda:0..6
-EMBED_DEVICES: list[str] = _parse_device_list(
-    os.getenv(
-        "RAG_EMBED_DEVICES",
-        "cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6",
-    )
-)
-
-# Устройство реранкера: по умолчанию cuda:7
-RERANK_DEVICE: str = os.getenv("RAG_RERANK_DEVICE", "cuda:7")
-
-# Совместимость со старой конфигурацией по ID
-_embed_gpu_ids_env = os.getenv("RAG_GPU_IDS_EMBED")
-if _embed_gpu_ids_env is not None and _embed_gpu_ids_env.strip() != "":
-    EMBED_GPU_IDS: list[int] = _parse_gpu_ids(_embed_gpu_ids_env)
-else:
-    EMBED_GPU_IDS = [int(d.split(":")[-1]) for d in EMBED_DEVICES if ":" in d]
-
-_rerank_gpu_ids_env = os.getenv("RAG_GPU_IDS_RERANK")
-if _rerank_gpu_ids_env is not None and _rerank_gpu_ids_env.strip() != "":
-    RERANK_GPU_IDS: list[int] = _parse_gpu_ids(_rerank_gpu_ids_env)
-else:
-    try:
-        RERANK_GPU_IDS = [int(RERANK_DEVICE.split(":")[-1])] if ":" in RERANK_DEVICE else [0]
-    except Exception:
-        RERANK_GPU_IDS = [0]
+EMBED_GPU_IDS: list[int] = _parse_gpu_ids(os.getenv("RAG_GPU_IDS_EMBED", "0,1"))
+RERANK_GPU_IDS: list[int] = _parse_gpu_ids(os.getenv("RAG_GPU_IDS_RERANK", "2"))
 RERANK_GPU_ID: int = RERANK_GPU_IDS[0]
-
-# Размер батча для эмбеддинга (per-GPU). При полной загрузке общий батч ~ EMBED_BATCH_SIZE * num_gpus
 EMBED_BATCH_SIZE: int = int(os.getenv("RAG_EMBED_BATCH", "64"))
-
-# Максимальная длина токенов для эмбеддера
-EMBED_MAX_LENGTH_TOKENS: int = int(os.getenv("RAG_EMBED_MAX_LENGTH_TOKENS", os.getenv("RAG_EMBED_MAX_LENGTH", "1024")))
-# Совместимость с прежним именем
-EMBED_MAX_LENGTH: int = EMBED_MAX_LENGTH_TOKENS
-
-# Динамическое уменьшение батча при OOM в воркере (опционально)
-DYNAMIC_BATCH: bool = os.getenv("RAG_DYNAMIC_BATCH", "1") not in {"0", "false", "False"}
-EMBED_MAX_LENGTH: int = int(os.getenv("RAG_EMBED_MAX_LENGTH", "256"))
 
 # Рантайм-настройки генерации / перевода (устанавливаются в create_rag_chain)
 runtime_openrouter_api_key: str | None = None

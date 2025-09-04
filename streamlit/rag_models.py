@@ -19,185 +19,41 @@ def _chunk_iter(items: list[str], size: int) -> list[list[str]]:
     return [items[i:i + size] for i in range(0, len(items), size)]
 
 
-# ---------------------------
-# Слой стойких воркеров эмбеддингов
-# ---------------------------
+def _worker_encode(args):
+    """Воркер-процесс для мульти-GPU энкодинга эмбеддингов.
 
-# Глобальное состояние воркеров
-_embed_workers: list[mp.Process] = []
-_embed_in_queue: mp.Queue | None = None
-_embed_out_queue: mp.Queue | None = None
-_embed_pending_jobs: int = 0
-
-
-def _normalize_device_to_visible_token(device: int | str) -> str:
-    """Преобразует устройство (int, 'cuda:N' или UUID) в токен для CUDA_VISIBLE_DEVICES."""
-    try:
-        if isinstance(device, int):
-            return str(int(device))
-        s = str(device)
-        if s.startswith("cuda:"):
-            return s.split(":", 1)[1]
-        return s
-    except Exception:
-        return str(device)
-
-
-def _embed_worker_main(
-    in_queue: mp.Queue,
-    out_queue: mp.Queue,
-    device_token: str,
-    model_name: str,
-    max_length: int,
-    inner_batch_size: int,
-) -> None:
-    """Главная функция GPU-воркера для кодирования эмбеддингов.
-
-    Воркёр загружает модель один раз и обрабатывает задания из своей очереди.
+    Параметры: (device_id, model_name, texts)
+    Возврат: np.ndarray float32 с L2-нормализацией на уровне модели.
     """
-    # Настройки среды и CUDA
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(device_token)
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    try:
-        import torch  # type: ignore
-        from sentence_transformers import SentenceTransformer as _ST  # локальный импорт
+    device_id, model_name, texts = args
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
+    from sentence_transformers import SentenceTransformer as _ST  # локальный импорт
+    import torch  # type: ignore
 
-        torch.set_grad_enabled(False)
-        if hasattr(torch, "backends") and hasattr(torch.backends, "cudnn"):
-            try:
-                torch.backends.cudnn.benchmark = True  # type: ignore
-            except Exception:
-                pass
-        torch.cuda.set_device(0)
-
-        model = _ST(model_name, trust_remote_code=True, device="cuda")
-        try:
-            model.max_seq_length = int(max_length)
-        except Exception:
-            pass
-        try:
-            model.eval()
-        except Exception:
-            pass
-
-        while True:
-            job = in_queue.get()
-            if job is None:
-                break
-            start_idx, texts = job  # job = (global_start_idx, list_of_texts)
-            if not isinstance(texts, list) or len(texts) == 0:
-                out_queue.put((int(start_idx), np.zeros((0, 0), dtype="float32")))
-                continue
-            try:
-                with torch.inference_mode():  # type: ignore
-                    emb = model.encode(
-                        sentences=texts,
-                        show_progress_bar=False,
-                        convert_to_numpy=True,
-                        normalize_embeddings=True,
-                        batch_size=int(inner_batch_size),
-                    ).astype("float32")
-                out_queue.put((int(start_idx), emb))
-            except Exception:
-                # В случае ошибки возвращаем пустой результат, чтобы не блокировать пайплайн
-                out_queue.put((int(start_idx), np.zeros((0, 0), dtype="float32")))
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-    except Exception:
-        # Критическая ошибка инициализации воркера — читаем задания, чтобы не повисли, и завершаем
-        while True:
-            job = in_queue.get()
-            if job is None:
-                break
-            try:
-                start_idx, _ = job
-                out_queue.put((int(start_idx), np.zeros((0, 0), dtype="float32")))
-            except Exception:
-                pass
+    torch.cuda.set_device(0)
+    model = _ST(model_name, trust_remote_code=True, device="cuda")
+    emb = model.encode(
+        sentences=texts,
+        show_progress_bar=False,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    ).astype("float32")
+    return emb
 
 
-def start_embed_workers(devices: list[str | int], model_name: str, max_length: int, batch_size: int) -> None:
-    """Запускает N GPU-воркеров по числу устройств.
-
-    Каждый воркер:
-    - выставляет CUDA_VISIBLE_DEVICES и выбирает cuda:0 внутри процесса;
-    - один раз загружает эмбеддер в eval() и работает в режиме inference;
-    - читает задания из своей очереди и отправляет результаты в общую out-очередь.
-    """
-    global _embed_workers, _embed_in_queue, _embed_out_queue, _embed_pending_jobs
-    stop_embed_workers()
-    if not isinstance(devices, list) or len(devices) == 0:
-        _embed_workers = []
-        _embed_in_queue = None
-        _embed_out_queue = None
-        _embed_pending_jobs = 0
-        return
-    ctx = mp.get_context("spawn")
-    _embed_in_queue = ctx.Queue(maxsize=256)
-    _embed_out_queue = ctx.Queue(maxsize=256)
-    _embed_workers = []
-    for i, dev in enumerate(devices):
-        token = _normalize_device_to_visible_token(dev)
-        p = ctx.Process(
-            target=_embed_worker_main,
-            args=(
-                _embed_in_queue,
-                _embed_out_queue,
-                str(token),
-                str(model_name),
-                int(max_length),
-                int(batch_size),
-            ),
-            daemon=True,
-        )
-        p.start()
-        _embed_workers.append(p)
-    _embed_pending_jobs = 0
-
-
-def submit_embed(job: tuple[int, list[str]]) -> None:
-    """Ставит задание на кодирование: job=(global_start_idx, list_of_texts)."""
-    global _embed_pending_jobs
-    if _embed_in_queue is None:
-        raise RuntimeError("Воркеры эмбеддингов не запущены: вызовите start_embed_workers().")
-    _embed_in_queue.put(job)
-    _embed_pending_jobs += 1
-
-
-def drain_embed() -> list[tuple[int, np.ndarray]]:
-    """Ожидает завершения всех поставленных заданий и возвращает результаты."""
-    global _embed_pending_jobs
-    if _embed_out_queue is None:
-        return []
-    results: list[tuple[int, np.ndarray]] = []
-    for _ in range(int(_embed_pending_jobs)):
-        res = _embed_out_queue.get()
-        results.append(res)
-    _embed_pending_jobs = 0
-    return results
-
-
-def stop_embed_workers() -> None:
-    """Останавливает воркеров и очищает ресурсы."""
-    global _embed_workers, _embed_in_queue, _embed_out_queue, _embed_pending_jobs
-    if _embed_in_queue is not None and _embed_workers:
-        for _ in _embed_workers:
-            try:
-                _embed_in_queue.put(None)
-            except Exception:
-                pass
-    if _embed_workers:
-        for p in _embed_workers:
-            try:
-                p.join(timeout=5)
-            except Exception:
-                pass
-    _embed_workers = []
-    _embed_in_queue = None
-    _embed_out_queue = None
-    _embed_pending_jobs = 0
+def encode_multi_gpu(texts: list[str], batch_size: int, gpu_ids: list[int]) -> np.ndarray:
+    """Распределённое кодирование эмбеддингов по нескольким GPU."""
+    if not texts:
+        return np.zeros((0, 0), dtype="float32")
+    batches = _chunk_iter(texts, batch_size)
+    tasks = []
+    for i, b in enumerate(batches):
+        device_id = gpu_ids[i % len(gpu_ids)]
+        tasks.append((device_id, rc.EMBEDDING_MODEL_NAME, b))
+    from multiprocessing import Pool
+    with Pool(processes=min(len(tasks), len(gpu_ids))) as pool:
+        results = pool.map(_worker_encode, tasks)
+    return np.concatenate(results, axis=0)
 
 
 def initialize_models() -> None:

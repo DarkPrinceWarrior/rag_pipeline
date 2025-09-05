@@ -84,6 +84,9 @@ FAISS_CPU_THREADS = (
     else (int(_cpu_threads_env) if _cpu_threads_env is not None else mp.cpu_count())
 )
 
+# Использовать ли FAISS на GPU (IndexShards). По умолчанию выключено.
+FAISS_USE_GPU = os.getenv("RAG_FAISS_USE_GPU", "0") not in {"0", "false", "False"}
+
 
 # ---------------------------
 # Ретрива / фьюжн

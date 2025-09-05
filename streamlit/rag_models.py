@@ -2,10 +2,12 @@ import os
 import multiprocessing as mp
 import numpy as np
 from multiprocessing.queues import Queue as MPQueue
+from typing import Any
 
 # Модели
 from sentence_transformers import SentenceTransformer
 from FlagEmbedding import FlagReranker
+from concurrent.futures import ThreadPoolExecutor
 
 # Язык/токенизация
 from lingua import Language, LanguageDetectorBuilder
@@ -194,33 +196,72 @@ def encode_multi_gpu(texts: list[str], batch_size: int, gpu_ids: list[int]) -> n
     return out
 
 
-def initialize_models(load_embedder: bool = True, load_reranker: bool = True) -> None:
-    """Инициализация и кэширование моделей/инструментов в глобальном состоянии rc.*
+def _optimize_torch_for_ampere() -> None:
+    """Включает оптимизации TF32 и autotune cuDNN."""
+    try:
+        import torch
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass
 
-    Аргументы управляют отложенной загрузкой крупных моделей для экономии GPU-памяти
-    в режимах, где они не требуются (например, при построении индекса).
-    """
+
+def build_reranker_pools() -> list[FlagReranker]:
+    """Создаёт экземпляр реранкера на каждый GPU из rc.RERANK_GPU_IDS."""
+    rerankers: list[FlagReranker] = []
+    for gid in rc.RERANK_GPU_IDS:
+        rr = FlagReranker(
+            rc.RERANKER_MODEL_NAME,
+            use_fp16=True,
+            devices=[int(gid)],
+        )
+        rerankers.append(rr)
+    return rerankers
+
+
+def rerank_multi_gpu(query: str, docs: list[str], rerankers: list[FlagReranker]) -> list[float]:
+    """Параллельный реранк кандидатов на нескольких GPU."""
+    if not docs:
+        return []
+    shards = np.array_split(np.arange(len(docs)), len(rerankers))
+    results: list[np.ndarray] = []
+    with ThreadPoolExecutor(len(rerankers)) as ex:
+        futures = []
+        for rr, idx in zip(rerankers, shards):
+            pairs = [(query, docs[i]) for i in idx]
+            futures.append(
+                ex.submit(
+                    rr.compute_score,
+                    pairs,
+                    batch_size=rc.RERANK_BATCH_SIZE,
+                    max_length=rc.RERANK_MAX_LENGTH,
+                )
+            )
+        for f in futures:
+            results.append(np.array(f.result(), dtype=np.float32))
+    out = np.empty(len(docs), dtype=np.float32)
+    for idx, scores in zip(shards, results):
+        out[idx] = scores
+    return out.tolist()
+
+
+def initialize_models(load_embedder: bool = True, load_reranker: bool = True) -> None:
+    """Инициализация и кэширование моделей/инструментов в глобальном состоянии rc.*"""
+
+    _optimize_torch_for_ampere()
+
     if load_embedder and rc.embedder is None:
         rc.embedder = SentenceTransformer(
             rc.EMBEDDING_MODEL_NAME,
             trust_remote_code=True,
             device=f"cuda:{rc.EMBED_GPU_IDS[0]}",
         )
-    if load_reranker and rc.reranker is None:
-        try:
-            import torch  # type: ignore
-            has_cuda = bool(getattr(torch.cuda, "is_available", lambda: False)())
-            device = f"cuda:{rc.RERANK_GPU_ID}" if has_cuda else os.getenv("RAG_DEFAULT_CUDA_DEVICE", "cuda:0")
-            use_fp16 = has_cuda
-        except Exception:
-            device = os.getenv("RAG_DEFAULT_CUDA_DEVICE", "cuda:0")
-            use_fp16 = False
-        rc.reranker = FlagReranker(
-            rc.RERANKER_MODEL_NAME,
-            use_fp16=use_fp16,
-            max_length=rc.RERANK_MAX_LENGTH,
-            device=device,
-        )
+    if load_reranker and not rc.reranker_pools:
+        rc.reranker_pools = build_reranker_pools()
+        if rc.reranker_pools:
+            rc.reranker = rc.reranker_pools[0]
     if rc.language_detector is None:
         try:
             langs = [Language.RUSSIAN, Language.ENGLISH, Language.UKRAINIAN, Language.BELARUSIAN]

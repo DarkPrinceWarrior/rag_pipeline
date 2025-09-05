@@ -103,6 +103,10 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
         except Exception:
             pass
         try:
+            rc.faiss_index = rc.to_gpu_sharded(rc.faiss_index)
+        except Exception:
+            pass
+        try:
             if rc.FAISS_CPU_THREADS is not None:
                 faiss.omp_set_num_threads(int(rc.FAISS_CPU_THREADS))
         except Exception:
@@ -233,6 +237,10 @@ def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: b
     except Exception:
         pass
     faiss.write_index(rc.faiss_index, faiss_path)
+    try:
+        rc.faiss_index = rc.to_gpu_sharded(rc.faiss_index)
+    except Exception:
+        pass
 
     # BM25: токенизация с учётом языка
     texts_for_bm25: List[tuple[str, str | None]] = []

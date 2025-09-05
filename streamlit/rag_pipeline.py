@@ -4,6 +4,13 @@ import re
 import unicodedata
 from typing import Any, Dict, List
 
+# --- Ранняя настройка JAX/XLA перед импортом bm25s (во время поиска) ---
+os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+_xla_frac = os.getenv("RAG_XLA_MEM_FRACTION")
+if _xla_frac:
+    os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = _xla_frac
+
 import bm25s
 import faiss
 import numpy as np

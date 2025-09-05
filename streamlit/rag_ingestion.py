@@ -7,7 +7,6 @@ from typing import Any, Dict, List
 
 import faiss
 import numpy as np
-import bm25s
 import unicodedata
 
 from langchain_docling import DoclingLoader
@@ -18,6 +17,15 @@ import rag_core as rc
 from rag_models import initialize_models, encode_multi_gpu
 from rag_pipeline import tokenize_text_by_lang  # DRY
 from rag_core import debug_log, ensure_dir
+
+
+# --- Ранняя настройка JAX/XLA памяти перед импортом bm25s ---
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+_xla_frac = os.getenv("RAG_XLA_MEM_FRACTION")
+if _xla_frac:
+    os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = _xla_frac
+
+import bm25s
 
 
 def extract_text_from_pdf(pdf_path: str) -> List[Dict[str, Any]]:

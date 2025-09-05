@@ -142,7 +142,6 @@ with st.sidebar:
 # Базовая директория проекта (корень), независимо от текущей рабочей директории
 BASE_DIR = Path(__file__).resolve().parents[1]
 PDF_DIR = BASE_DIR / "pdfs"
-VECTOR_STORE_PATH = BASE_DIR / "faiss_index"
 PDF_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Инициализация состояния сессии ---
@@ -170,7 +169,7 @@ if process_button:
             try:
                 build_and_load_knowledge_base(
                     pdf_dir=PDF_DIR,
-                    index_dir=VECTOR_STORE_PATH,
+                    index_dir=rc.VECTOR_STORE_PATH,
                     force_rebuild=True
                 )
                 st.session_state.rag_chain = create_rag_chain(
@@ -185,15 +184,15 @@ if process_button:
                 st.success("База знаний успешно создана!")
             except Exception as e:
                 st.error(f"Произошла ошибка при обработке документов: {e}")
-                if VECTOR_STORE_PATH.exists():
-                    shutil.rmtree(VECTOR_STORE_PATH)
+                if Path(rc.VECTOR_STORE_PATH).exists():
+                    shutil.rmtree(Path(rc.VECTOR_STORE_PATH))
 
 # --- Загрузка базы знаний при первом запуске, если она уже есть ---
 if st.session_state.rag_chain is None and 'openrouter_api_key' in st.session_state:
     try:
         if build_and_load_knowledge_base(
             pdf_dir=PDF_DIR,
-            index_dir=VECTOR_STORE_PATH,
+            index_dir=rc.VECTOR_STORE_PATH,
             force_rebuild=False
         ):
             st.session_state.rag_chain = create_rag_chain(
@@ -265,7 +264,7 @@ if prompt := st.chat_input("Ваш вопрос..."):
                             }
                             for it in fused[:20]
                         ]
-                        st.dataframe(rows_fused, use_container_width=True)
+                        st.dataframe(rows_fused, width='stretch')
 
                     # Блок Результаты реранка (top-5)
                     with st.expander("Результаты реранка (top-5)"):
@@ -280,7 +279,7 @@ if prompt := st.chat_input("Ваш вопрос..."):
                             }
                             for it in reranked[:5]
                         ]
-                        st.dataframe(rows_rerank, use_container_width=True)
+                        st.dataframe(rows_rerank, width='stretch')
 
                     # Панель Context Pack (после MMR)
                     with st.expander("Context Pack (после MMR)", expanded=True):
@@ -316,7 +315,7 @@ if prompt := st.chat_input("Ваш вопрос..."):
                                     "anchor": anchor,
                                 })
                                 seen.add(cid)
-                        st.dataframe(rows_ctx, use_container_width=True)
+                        st.dataframe(rows_ctx, width='stretch')
 
                         # Сводка
                         k = len(context_pack)
@@ -341,7 +340,7 @@ if prompt := st.chat_input("Ваш вопрос..."):
                                 {"reason": k, "count": v}
                                 for k, v in sorted(rejected_reasons.items(), key=lambda x: (-int(x[1]), str(x[0])))
                             ]
-                            st.dataframe(rej_rows, use_container_width=True)
+                            st.dataframe(rej_rows, width='stretch')
 
                     # Отладка efSearch: показываем применённые значения (если включено)
                     with st.expander("Диагностика efSearch"):
@@ -407,7 +406,7 @@ if prompt := st.chat_input("Ваш вопрос..."):
                                 "anchor": _make_anchor({"source": m.get("source"), "page": m.get("page")}),
                             })
                     with st.expander("Список источников", expanded=bool(rows_sources)):
-                        st.dataframe(rows_sources, use_container_width=True)
+                        st.dataframe(rows_sources, width='stretch')
 
                     flags = gen_out.get("flags", {}) or {}
                     lang_detected = gen_out.get("answer_lang_detected")

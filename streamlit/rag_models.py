@@ -1,6 +1,7 @@
 import os
 import multiprocessing as mp
 import numpy as np
+from multiprocessing.queues import Queue as MPQueue
 
 # Модели
 from sentence_transformers import SentenceTransformer
@@ -19,68 +20,178 @@ def _chunk_iter(items: list[str], size: int) -> list[list[str]]:
     return [items[i:i + size] for i in range(0, len(items), size)]
 
 
-def _worker_encode(args):
-    """Воркер-процесс для мульти-GPU энкодинга эмбеддингов.
+"""
+Мульти-GPU энкодинг с «стойкими» воркерами.
 
-    Параметры: (device_id, model_name, texts, batch_size)
-    Возврат: np.ndarray float32 с L2-нормализацией на уровне модели.
+Воркеры создаются один раз на GPU, загружают модель и обрабатывают задания из очереди.
+encode_multi_gpu отправляет задания по шардированным частям входного списка и собирает
+результаты, восстанавливая исходный порядок по позициям.
+"""
+
+_EMBED_CTX: mp.context.BaseContext | None = None
+_EMBED_TASK_QUEUE: MPQueue | None = None
+_EMBED_RESULT_QUEUE: MPQueue | None = None
+_EMBED_WORKERS: list[mp.Process] = []
+
+
+def _embed_worker_main(device_id: int, model_name: str, batch_size: int, task_q: MPQueue, result_q: MPQueue) -> None:
+    """Основной цикл воркера энкодинга на конкретном устройстве.
+
+    Ожидает задания вида (job_id, shard_id, positions, texts) и возвращает
+    (job_id, shard_id, positions, embeddings: np.ndarray float32).
     """
-    device_id, model_name, texts, batch_size = args
-    from sentence_transformers import SentenceTransformer as _ST  # локальный импорт
+    try:
+        try:
+            import torch  # type: ignore
+            has_cuda = bool(getattr(torch.cuda, "is_available", lambda: False)())
+        except Exception:
+            has_cuda = False
+        device = f"cuda:{int(device_id)}" if has_cuda else os.getenv("RAG_DEFAULT_CUDA_DEVICE", "cuda:0")
+        model = SentenceTransformer(model_name, trust_remote_code=True, device=device)
+    except Exception:
+        model = SentenceTransformer(model_name, trust_remote_code=True)
 
-    device = f"cuda:{int(device_id)}"
-    model = _ST(model_name, trust_remote_code=True, device=device)
-    batches = _chunk_iter(texts, int(batch_size))
-    outputs: list[np.ndarray] = []
-    for b in batches:
-        emb = model.encode(
-            sentences=b,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-        ).astype("float32")
-        outputs.append(emb)
-    return np.concatenate(outputs, axis=0) if outputs else np.zeros((0, 0), dtype="float32")
+    while True:
+        task = task_q.get()
+        if task is None:
+            break
+        job_id, shard_id, positions, texts = task
+        outputs: list[np.ndarray] = []
+        for batch in _chunk_iter(texts, int(batch_size)):
+            if not batch:
+                continue
+            emb = model.encode(
+                sentences=batch,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+            ).astype("float32")
+            outputs.append(emb)
+        arr = np.concatenate(outputs, axis=0) if outputs else np.zeros((0, 0), dtype="float32")
+        result_q.put((job_id, shard_id, positions, arr))
+
+
+def start_embed_workers(gpu_ids: list[int], model_name: str, batch_size: int) -> None:
+    """Запускает воркеры энкодинга: по одному процессу на GPU.
+
+    Воркеры получают задания через общую очередь и возвращают результаты в общую очередь.
+    """
+    global _EMBED_CTX, _EMBED_TASK_QUEUE, _EMBED_RESULT_QUEUE, _EMBED_WORKERS
+    if _EMBED_WORKERS:
+        return
+    _EMBED_CTX = mp.get_context("spawn")
+    _EMBED_TASK_QUEUE = _EMBED_CTX.Queue()
+    _EMBED_RESULT_QUEUE = _EMBED_CTX.Queue()
+    _EMBED_WORKERS = []
+    for gid in gpu_ids:
+        p = _EMBED_CTX.Process(
+            target=_embed_worker_main,
+            args=(int(gid), model_name, int(batch_size), _EMBED_TASK_QUEUE, _EMBED_RESULT_QUEUE),
+            daemon=True,
+        )
+        p.start()
+        _EMBED_WORKERS.append(p)
+
+
+def submit_embed(job_id: int, shard_id: int, positions: list[int], texts: list[str]) -> None:
+    """Отправляет задание на энкодинг в очередь."""
+    if _EMBED_TASK_QUEUE is None:
+        raise RuntimeError("Очередь заданий не инициализирована. Вызовите start_embed_workers().")
+    _EMBED_TASK_QUEUE.put((int(job_id), int(shard_id), positions, texts))
+
+
+def drain_embed(job_id: int, expected_tasks: int, total_count: int) -> np.ndarray:
+    """Собирает результаты для указанного job_id, восстанавливая порядок по positions.
+
+    expected_tasks — число шардов, отправленных в submit_embed.
+    total_count — общее число текстов во входе.
+    """
+    if _EMBED_RESULT_QUEUE is None:
+        raise RuntimeError("Очередь результатов не инициализирована. Вызовите start_embed_workers().")
+    received = 0
+    out: np.ndarray | None = None
+    while received < int(expected_tasks):
+        r_job, _shard, positions, arr = _EMBED_RESULT_QUEUE.get()
+        if r_job != job_id:
+            # В текущем дизайне конкурирующих job нет, но проверка остаётся на будущее
+            continue
+        if out is None:
+            dim = int(arr.shape[1]) if isinstance(arr, np.ndarray) and arr.size > 0 else 0
+            out = np.zeros((int(total_count), dim), dtype="float32") if dim > 0 else np.zeros((0, 0), dtype="float32")
+        if out.size > 0 and isinstance(arr, np.ndarray) and arr.size > 0:
+            for i, pos in enumerate(positions):
+                if i < arr.shape[0]:
+                    out[int(pos)] = arr[i]
+        received += 1
+    return out if out is not None else np.zeros((0, 0), dtype="float32")
+
+
+def stop_embed_workers() -> None:
+    """Останавливает воркеры и очищает ресурсы."""
+    global _EMBED_CTX, _EMBED_TASK_QUEUE, _EMBED_RESULT_QUEUE, _EMBED_WORKERS
+    if not _EMBED_WORKERS:
+        return
+    if _EMBED_TASK_QUEUE is not None:
+        for _ in _EMBED_WORKERS:
+            _EMBED_TASK_QUEUE.put(None)
+    for p in _EMBED_WORKERS:
+        try:
+            p.join()
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+    _EMBED_WORKERS = []
+    _EMBED_TASK_QUEUE = None
+    _EMBED_RESULT_QUEUE = None
+    _EMBED_CTX = None
 
 
 def encode_multi_gpu(texts: list[str], batch_size: int, gpu_ids: list[int]) -> np.ndarray:
-    """Распределённое кодирование эмбеддингов по нескольким GPU.
+    """Кодирование эмбеддингов на нескольких GPU с восстановлением порядка.
 
-    Алгоритм:
-    - Делим вход на равные по количеству чанки по числу доступных GPU.
-    - На каждый GPU запускается один процесс, который один раз загружает модель
-      на свой `cuda:{id}` и обрабатывает свой срез входа батчами.
-    Это гарантирует равномерное распределение памяти и отсутствие лавины на `cuda:0`.
+    - Делим вход на шардов по числу GPU (равными по количеству элементов).
+    - Отправляем задания воркерам с позициями исходных элементов.
+    - Собираем результаты и размещаем по соответствующим позициям.
     """
     if not texts:
         return np.zeros((0, 0), dtype="float32")
 
-    num_gpus = max(1, len(gpu_ids))
-    # Равномерное разбиение входа по GPU
-    shard_sizes = [(len(texts) + i) // num_gpus for i in range(num_gpus)]
-    shards: list[list[str]] = []
+    gids = gpu_ids if gpu_ids else rc.EMBED_GPU_IDS
+    num_gpus = max(1, len(gids))
+
+    # План разбиения: равномерно по количеству
+    n = len(texts)
+    shard_sizes = [(n + i) // num_gpus for i in range(num_gpus)]
+    shards_pos: list[list[int]] = []
+    shards_txt: list[list[str]] = []
     start = 0
     for sz in shard_sizes:
         end = start + sz
-        shards.append(texts[start:end])
+        positions = list(range(start, end))
+        texts_slice = texts[start:end]
+        shards_pos.append(positions)
+        shards_txt.append(texts_slice)
         start = end
 
-    tasks = []
-    for i, shard in enumerate(shards):
-        if not shard:
+    # Запуск воркеров и отправка заданий
+    start_embed_workers(gids, rc.EMBEDDING_MODEL_NAME, int(batch_size))
+    job_id = 1
+    expected = 0
+    for shard_id, (pos, txt) in enumerate(zip(shards_pos, shards_txt)):
+        if not txt:
             continue
-        device_id = gpu_ids[i % num_gpus]
-        # Одна задача на один GPU: внутри задачи выполняется батчинг
-        tasks.append((device_id, rc.EMBEDDING_MODEL_NAME, shard, int(batch_size)))
+        submit_embed(job_id, shard_id, pos, txt)
+        expected += 1
 
-    if not tasks:
+    if expected == 0:
+        stop_embed_workers()
         return np.zeros((0, 0), dtype="float32")
 
-    from multiprocessing import Pool
-    # Ровно по одному воркеру на задачу/GPU, чтобы каждая модель была загружена один раз
-    with Pool(processes=len(tasks)) as pool:
-        results = pool.map(_worker_encode, tasks)
-    return np.concatenate(results, axis=0)
+    out = drain_embed(job_id, expected, n)
+    stop_embed_workers()
+    return out
 
 
 def initialize_models(load_embedder: bool = True, load_reranker: bool = True) -> None:

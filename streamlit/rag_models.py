@@ -208,38 +208,39 @@ def _optimize_torch_for_ampere() -> None:
         pass
 
 
-def build_reranker_pools() -> list[tuple[FlagReranker, Any, str]]:
-    """Создаёт по процессу реранкера на каждый GPU из rc.RERANK_GPU_IDS."""
-    pools: list[tuple[FlagReranker, Any, str]] = []
-    devices = [f"cuda:{gid}" for gid in rc.RERANK_GPU_IDS]
-    for dev in devices:
-        rr = FlagReranker(rc.RERANKER_MODEL_NAME, use_fp16=True, device=dev)
-        pool = rr.start_multi_process_pool(target_devices=[dev])
-        pools.append((rr, pool, dev))
-    return pools
+def build_reranker_pools() -> list[FlagReranker]:
+    """Создаёт экземпляр реранкера на каждый GPU из rc.RERANK_GPU_IDS."""
+    rerankers: list[FlagReranker] = []
+    for gid in rc.RERANK_GPU_IDS:
+        rr = FlagReranker(
+            rc.RERANKER_MODEL_NAME,
+            use_fp16=True,
+            devices=[int(gid)],
+        )
+        rerankers.append(rr)
+    return rerankers
 
 
-def rerank_multi_gpu(query: str, docs: list[str], pools: list[tuple[FlagReranker, Any, str]]) -> list[float]:
+def rerank_multi_gpu(query: str, docs: list[str], rerankers: list[FlagReranker]) -> list[float]:
     """Параллельный реранк кандидатов на нескольких GPU."""
     if not docs:
         return []
-    shards = np.array_split(np.arange(len(docs)), len(pools))
-    results: list[list[float]] = []
-    with ThreadPoolExecutor(len(pools)) as ex:
+    shards = np.array_split(np.arange(len(docs)), len(rerankers))
+    results: list[np.ndarray] = []
+    with ThreadPoolExecutor(len(rerankers)) as ex:
         futures = []
-        for (rr, pool, _), idx in zip(pools, shards):
+        for rr, idx in zip(rerankers, shards):
+            pairs = [(query, docs[i]) for i in idx]
             futures.append(
                 ex.submit(
-                    rr.compute_score_multi_process,
-                    pool,
-                    [query] * len(idx),
-                    [docs[i] for i in idx],
+                    rr.compute_score,
+                    pairs,
                     batch_size=rc.RERANK_BATCH_SIZE,
                     max_length=rc.RERANK_MAX_LENGTH,
                 )
             )
         for f in futures:
-            results.append(f.result())
+            results.append(np.array(f.result(), dtype=np.float32))
     out = np.empty(len(docs), dtype=np.float32)
     for idx, scores in zip(shards, results):
         out[idx] = scores
@@ -260,7 +261,7 @@ def initialize_models(load_embedder: bool = True, load_reranker: bool = True) ->
     if load_reranker and not rc.reranker_pools:
         rc.reranker_pools = build_reranker_pools()
         if rc.reranker_pools:
-            rc.reranker = rc.reranker_pools[0][0]
+            rc.reranker = rc.reranker_pools[0]
     if rc.language_detector is None:
         try:
             langs = [Language.RUSSIAN, Language.ENGLISH, Language.UKRAINIAN, Language.BELARUSIAN]

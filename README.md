@@ -9,6 +9,10 @@ export RAG_GPU_IDS_RERANK=6,7
 export RAG_EMBEDDING_MODEL="google/embeddinggemma-300m"   # 1024-d, MRL/квант.-friendly п
 export RAG_RERANK_MODEL="BAAI/bge-reranker-v2-m3"          # быстрый SOTA реранкер v2
 
+export RAG_FALLBACK_WEB=1
+export RAG_FALLBACK_WEB_MODEL="perplexity/llama-3.1-sonar-large-128k-online"
+export RAG_OPENROUTER_MODEL="openai/gpt-oss-120b"
+
 # Батчи (стартовые — под A5000 24GB; при длинных текстах можно снизить)
 export RAG_EMBED_BATCH=128
 export RAG_RERANK_BATCH_SIZE=96

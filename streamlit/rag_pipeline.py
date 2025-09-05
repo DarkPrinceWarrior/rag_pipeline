@@ -1058,6 +1058,84 @@ def create_rag_chain(
                 pass
 
         if insufficient:
+            # Фолбэки при отсутствии контекста
+            # 1) Веб-фолбэк (модель с доступом к интернету через OpenRouter)
+            if bool(getattr(rc, "FALLBACK_WEB_ENABLE", False)) and isinstance(getattr(rc, "FALLBACK_WEB_MODEL", None), str):
+                web_system = (
+                    f"Отвечай только на языке: {target_lang}.\n" +
+                    str(getattr(rc, "FALLBACK_WEB_SYSTEM_PROMPT", ""))
+                )
+                web_messages = [
+                    {"role": "system", "content": web_system},
+                    {"role": "user", "content": question},
+                ]
+                try:
+                    web_json = call_openrouter_chat_completion(
+                        api_key=rc.runtime_openrouter_api_key,
+                        model=str(getattr(rc, "FALLBACK_WEB_MODEL")),
+                        messages=web_messages,
+                        extra_request_kwargs={
+                            "temperature": float(rc.runtime_llm_temperature if rc.runtime_llm_temperature is not None else rc.LLM_DEFAULT_TEMPERATURE),
+                            "max_tokens": int(rc.runtime_llm_max_tokens if rc.runtime_llm_max_tokens is not None else rc.LLM_DEFAULT_MAX_TOKENS),
+                        },
+                    )
+                    web_answer = web_json.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or web_json.get("choices", [{}])[0].get("text", "").strip()
+                except Exception:
+                    web_answer = ""
+                if web_answer:
+                    ans_lang = _detect_question_lang(web_answer) or target_lang
+                    return {
+                        "final_answer": web_answer,
+                        "used_sources": [],
+                        "answer_lang_detected": ans_lang,
+                        "flags": {
+                            "regenerated_for_lang": False,
+                            "regenerated_for_citations": False,
+                            "insufficient": False,
+                            "fallback_web": True,
+                            "fallback_freeform": False,
+                        },
+                    }
+
+            # 2) Свободный фолбэк (без интернет-поиска)
+            if bool(getattr(rc, "FALLBACK_FREEFORM_ENABLE", False)):
+                ff_system = (
+                    f"Отвечай только на языке: {target_lang}.\n" +
+                    str(getattr(rc, "FALLBACK_FREEFORM_SYSTEM_PROMPT", ""))
+                )
+                ff_messages = [
+                    {"role": "system", "content": ff_system},
+                    {"role": "user", "content": question},
+                ]
+                try:
+                    ff_json = call_openrouter_chat_completion(
+                        api_key=rc.runtime_openrouter_api_key,
+                        model=rc.runtime_openrouter_model,
+                        messages=ff_messages,
+                        extra_request_kwargs={
+                            "temperature": float(rc.runtime_llm_temperature if rc.runtime_llm_temperature is not None else rc.LLM_DEFAULT_TEMPERATURE),
+                            "max_tokens": int(rc.runtime_llm_max_tokens if rc.runtime_llm_max_tokens is not None else rc.LLM_DEFAULT_MAX_TOKENS),
+                        },
+                    )
+                    ff_answer = ff_json.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or ff_json.get("choices", [{}])[0].get("text", "").strip()
+                except Exception:
+                    ff_answer = ""
+                if ff_answer:
+                    ans_lang = _detect_question_lang(ff_answer) or target_lang
+                    return {
+                        "final_answer": ff_answer,
+                        "used_sources": [],
+                        "answer_lang_detected": ans_lang,
+                        "flags": {
+                            "regenerated_for_lang": False,
+                            "regenerated_for_citations": False,
+                            "insufficient": False,
+                            "fallback_web": False,
+                            "fallback_freeform": True,
+                        },
+                    }
+
+            # 3) Жёсткий ответ об отсутствии знаний (по умолчанию)
             return {
                 "final_answer": rc.INSUFFICIENT_ANSWER,
                 "used_sources": [],
@@ -1066,6 +1144,8 @@ def create_rag_chain(
                     "regenerated_for_lang": False,
                     "regenerated_for_citations": False,
                     "insufficient": True,
+                    "fallback_web": False,
+                    "fallback_freeform": False,
                 },
             }
 

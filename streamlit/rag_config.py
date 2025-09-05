@@ -185,3 +185,28 @@ RELAX_DUP_EMB_COS_STEP = float(os.getenv("RAG_RELAX_DUP_COS_STEP", "0.02"))
 RELAX_DUP_EMB_COS_MAX = float(os.getenv("RAG_RELAX_DUP_COS_MAX", "0.96"))
 
 
+# ---------------------------
+# Фолбэки при отсутствии контекста
+# ---------------------------
+FALLBACK_FREEFORM_ENABLE = os.getenv("RAG_FALLBACK_FREEFORM", "1") not in {"0", "false", "False"}
+FALLBACK_WEB_ENABLE = os.getenv("RAG_FALLBACK_WEB", "0") not in {"0", "false", "False"}
+FALLBACK_WEB_MODEL = os.getenv(
+    "RAG_FALLBACK_WEB_MODEL",
+    "perplexity/llama-3.1-sonar-large-128k-online",
+)
+
+# Системные подсказки для фолбэков
+FALLBACK_FREEFORM_SYSTEM_PROMPT = os.getenv(
+    "RAG_FALLBACK_FREEFORM_SYSTEM_PROMPT",
+    (
+        "Если не предоставлены источники, отвечай на основе общих знаний, "
+        "кратко и по существу. Ясно обозначай допущения. Источники не требуются."
+    ),
+)
+FALLBACK_WEB_SYSTEM_PROMPT = os.getenv(
+    "RAG_FALLBACK_WEB_SYSTEM_PROMPT",
+    (
+        "Если не предоставлены источники, ты можешь искать информацию в интернете. "
+        "Приводи короткие ссылки на найденные страницы в конце ответа."
+    ),
+)

@@ -62,6 +62,11 @@ from rag_config import (
     RERANK_GPU_ID,
     EMBED_BATCH_SIZE,
     FAISS_USE_GPU,
+    FALLBACK_FREEFORM_ENABLE,
+    FALLBACK_WEB_ENABLE,
+    FALLBACK_WEB_MODEL,
+    FALLBACK_FREEFORM_SYSTEM_PROMPT,
+    FALLBACK_WEB_SYSTEM_PROMPT,
 )
 
 # Рантайм-настройки генерации / перевода (устанавливаются в create_rag_chain)

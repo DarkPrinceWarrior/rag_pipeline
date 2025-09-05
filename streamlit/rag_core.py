@@ -1,25 +1,6 @@
 import os
-import multiprocessing as mp
-import json
 from pathlib import Path
 from typing import Any
-
-# -------------------------------------------------
-# Минимальные ранние настройки среды (GPU/OMP/XLA)
-# -------------------------------------------------
-os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
-os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-try:
-    mp.set_start_method("spawn", force=True)
-except Exception:
-    pass
-_xla_frac = os.getenv("RAG_XLA_MEM_FRACTION")
-if _xla_frac:
-    os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = _xla_frac
 
 from rag_config import (
     BASE_DIR,
@@ -78,13 +59,6 @@ from rag_config import (
     RERANK_GPU_ID,
     EMBED_BATCH_SIZE,
 )
-
-try:
-    if FAISS_CPU_THREADS is not None:
-        import faiss as _faiss  # локальный импорт
-        _faiss.omp_set_num_threads(int(FAISS_CPU_THREADS))
-except Exception:
-    pass
 
 # Рантайм-настройки генерации / перевода (устанавливаются в create_rag_chain)
 runtime_openrouter_api_key: str | None = None

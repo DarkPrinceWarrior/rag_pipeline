@@ -159,6 +159,10 @@ REGEN_LANG_RATIO_THRESHOLD = float(os.getenv("RAG_LANG_RATIO_THRESHOLD", "0.9"))
 MAX_QUOTE_WORDS = int(os.getenv("RAG_MAX_QUOTE_WORDS", "30"))
 INSUFFICIENT_MIN_RERANK_SUM = float(os.getenv("RAG_MIN_RERANK_SUM", "0.0"))
 
+# Требовать ли наличие хотя бы одного чанка на языке вопроса в контексте.
+# По умолчанию выключено, чтобы не блокировать кросс-языковые ответы.
+REQUIRE_TARGET_LANG_IN_CONTEXT = os.getenv("RAG_REQUIRE_TARGET_LANG_CONTEXT", "0") not in {"0", "false", "False"}
+
 # Текстовые сообщения
 INSUFFICIENT_PREFIX = os.getenv("RAG_INSUFFICIENT_PREFIX", "Недостаточно данных")
 INSUFFICIENT_ANSWER = os.getenv(

@@ -1049,8 +1049,11 @@ def create_rag_chain(
                         if rc.chunks_metadata[int(cid)].get("lang") == target_lang:
                             has_target_lang = True
                             break
-                if target_lang in {"ru", "en"} and not has_target_lang:
-                    insufficient = True
+                # Требование совпадения языка контекста с языком вопроса делаем опциональным.
+                # По умолчанию не блокируем кросс-языковые ответы (см. rc.REQUIRE_TARGET_LANG_IN_CONTEXT).
+                if bool(getattr(rc, "REQUIRE_TARGET_LANG_IN_CONTEXT", False)):
+                    if target_lang in {"ru", "en"} and not has_target_lang:
+                        insufficient = True
             except Exception:
                 pass
 

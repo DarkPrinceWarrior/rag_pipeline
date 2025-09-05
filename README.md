@@ -40,6 +40,6 @@ export TRANSFORMERS_CACHE=/mnt/ssd/hf/hub
 export HF_DATASETS_CACHE=/mnt/ssd/hf/datasets
 
 # Запуск твоих скриптов
-python scripts/build_kb.py
+PYTHONPATH=/root/almaservice/rag_pipeline/streamlit:/root/almaservice/rag_pipeline python3 /root/almaservice/rag_pipeline/scripts/build_kb.py
 streamlit run streamlit/app.py --server.headless true --server.port 8501
  -->

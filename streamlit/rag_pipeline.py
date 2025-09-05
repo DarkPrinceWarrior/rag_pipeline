@@ -12,6 +12,15 @@ import requests
 import rag_core as rc
 from rag_core import debug_log, format_citation
 from rag_models import initialize_models
+from rag_config import (
+    RETRIEVAL_DENSE_RU,
+    RETRIEVAL_BM25_RU,
+    RETRIEVAL_DENSE_EN,
+    RETRIEVAL_BM25_EN,
+    RETRIEVAL_DENSE_ORIG,
+    RETRIEVAL_BM25_ORIG,
+    RRF_BRANCH_PRIORITY,
+)
 
 
 # --- Языковые утилиты ---
@@ -104,13 +113,6 @@ def simple_query_translation(question: str, q_lang: str | None = None) -> Dict[s
 
 # --- Кандидаты и ретривал ---
 
-RETRIEVAL_DENSE_RU = "dense_ru"
-RETRIEVAL_BM25_RU = "bm25_ru"
-RETRIEVAL_DENSE_EN = "dense_en"
-RETRIEVAL_BM25_EN = "bm25_en"
-RETRIEVAL_DENSE_ORIG = "dense_orig"
-RETRIEVAL_BM25_ORIG = "bm25_orig"
-
 
 def build_candidate_dict(chunk_global_id: int, retrieval_label: str, rank: int, score_raw: float) -> Dict[str, Any]:
     """Создаёт единый словарь для кандидата документа."""
@@ -145,10 +147,10 @@ def _compute_intersections_report(cands: Dict[str, List[Dict[str, Any]]]) -> Dic
     """Подсчёт пересечений по chunk_id между ветками."""
     branches = [RETRIEVAL_DENSE_RU, RETRIEVAL_BM25_RU, RETRIEVAL_DENSE_EN, RETRIEVAL_BM25_EN]
     name_to_list = {
-        RETRIEVAL_DENSE_RU: cands.get("dense_ru", []),
-        RETRIEVAL_BM25_RU: cands.get("bm25_ru", []),
-        RETRIEVAL_DENSE_EN: cands.get("dense_en", []),
-        RETRIEVAL_BM25_EN: cands.get("bm25_en", []),
+        RETRIEVAL_DENSE_RU: cands.get(RETRIEVAL_DENSE_RU, []),
+        RETRIEVAL_BM25_RU: cands.get(RETRIEVAL_BM25_RU, []),
+        RETRIEVAL_DENSE_EN: cands.get(RETRIEVAL_DENSE_EN, []),
+        RETRIEVAL_BM25_EN: cands.get(RETRIEVAL_BM25_EN, []),
     }
     name_to_idset = {name: {c.get("chunk_id") for c in lst} for name, lst in name_to_list.items()}
     name_to_idmap = {name: {c.get("chunk_id"): c for c in lst} for name, lst in name_to_list.items()}
@@ -327,10 +329,10 @@ def fuse_candidates_rrf(cands_by_branch: Dict[str, List[Dict[str, Any]]]) -> Lis
     if not cands_by_branch:
         return []
 
-    branch_priority = ["dense_ru", "bm25_ru", "dense_en", "bm25_en"]
+    branch_priority = RRF_BRANCH_PRIORITY
 
     def weight_for_branch(branch_key: str) -> float:
-        return rc.RRF_WEIGHT_DENSE if branch_key in ("dense_ru", "dense_en") else rc.RRF_WEIGHT_BM25
+        return rc.RRF_WEIGHT_DENSE if branch_key in (RETRIEVAL_DENSE_RU, RETRIEVAL_DENSE_EN) else rc.RRF_WEIGHT_BM25
 
     aggregated: Dict[int, Dict[str, Any]] = {}
 
@@ -418,7 +420,7 @@ def call_openrouter_chat_completion(api_key, model, messages, endpoint=rc.OPENRO
     if extra_request_kwargs:
         payload.update(extra_request_kwargs)
     try:
-        resp = requests.post(endpoint, headers=headers, json=payload, timeout=60)
+        resp = requests.post(endpoint, headers=headers, json=payload, timeout=rc.OPENROUTER_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -449,7 +451,7 @@ def hybrid_search_with_rerank(question: str, apply_lang_quota: bool = True) -> D
         return {
             "q_lang": _ql,
             "answer_lang": _al,
-            "active_branches": [k for k in ("dense_ru", "bm25_ru", "dense_en", "bm25_en") if cands_by_branch.get(k)],
+            "active_branches": [k for k in RRF_BRANCH_PRIORITY if cands_by_branch.get(k)],
             "fused": [],
             "reranked": [],
             "context_pack": [],
@@ -530,7 +532,7 @@ def hybrid_search_with_rerank(question: str, apply_lang_quota: bool = True) -> D
     return {
         "q_lang": _ql,
         "answer_lang": answer_lang,
-        "active_branches": [k for k in ("dense_ru", "bm25_ru", "dense_en", "bm25_en") if cands_by_branch.get(k)],
+        "active_branches": [k for k in RRF_BRANCH_PRIORITY if cands_by_branch.get(k)],
         "fused": fused_top[:20],
         "reranked": reranked_top,
         "context_pack": context_pack,
@@ -940,7 +942,7 @@ def build_generation_prompt(question: str, context_pack: List[Dict[str, Any]], s
         "Не вставляй текст на других языках.\n"
         "Используй исключительно информацию из раздела «Источники».\n"
         "Каждый ключевой тезис помечай ссылкой [S#] — номер из списка «Источники».\n"
-        "Если сведений недостаточно — начни ответ строкой: \"Недостаточно данных\" и перечисли, чего именно не хватает.\n"
+        f"Если сведений недостаточно — начни ответ строкой: \"{rc.INSUFFICIENT_PREFIX}\" и перечисли, чего именно не хватает.\n"
         "Не добавляй внешние сведения и не пытайся угадывать.\n"
         "Если вопрос вне контекста источников — так и скажи, без «общих знаний».\n"
         "Не вставляй длинные прямые цитаты из источников; перефразируй, добавив [S#]. Допускаются короткие цитаты ≤ "
@@ -1043,7 +1045,7 @@ def create_rag_chain(
 
         if insufficient:
             return {
-                "final_answer": "Недостаточно данных для надёжного ответа. Нужны релевантные источники по вашему вопросу.",
+                "final_answer": rc.INSUFFICIENT_ANSWER,
                 "used_sources": [],
                 "answer_lang_detected": target_lang,
                 "flags": {

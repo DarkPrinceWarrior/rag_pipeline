@@ -21,100 +21,70 @@ _xla_frac = os.getenv("RAG_XLA_MEM_FRACTION")
 if _xla_frac:
     os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = _xla_frac
 
-# ---------------------------
-# Конфигурация / Константы
-# ---------------------------
-BASE_DIR = Path(__file__).resolve().parents[1]
-PDF_DIR = str(BASE_DIR / "pdfs")
-VECTOR_STORE_PATH = str(BASE_DIR / "faiss_index")
-EMBEDDING_MODEL_NAME = "google/embeddinggemma-300m"
-RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
-TOP_K_RETRIEVAL = 15
-TOP_K_FINAL = 5
-OPENROUTER_MODEL = "openai/gpt-oss-120b"
-OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+from rag_config import (
+    BASE_DIR,
+    PDF_DIR,
+    VECTOR_STORE_PATH,
+    EMBEDDING_MODEL_NAME,
+    RERANKER_MODEL_NAME,
+    CHUNK_SIZE,
+    CHUNK_OVERLAP,
+    CHUNK_MIN_CHARS,
+    OPENROUTER_MODEL,
+    OPENROUTER_ENDPOINT,
+    OPENROUTER_TIMEOUT,
+    HNSW_M,
+    HNSW_EF_CONSTRUCTION,
+    HNSW_EF_SEARCH_BASE,
+    HNSW_EF_SEARCH_PER_TOPK_MULT,
+    HNSW_USE_DYNAMIC_EF_SEARCH,
+    HNSW_EF_SEARCH_MAX,
+    HNSW_FAILSAFE_RATIO,
+    HNSW_FAILSAFE_MAX_RETRY,
+    FAISS_CPU_THREADS,
+    TOP_K_DENSE_BRANCH,
+    TOP_K_BM25_BRANCH,
+    RRF_K,
+    TOP_K_RERANK_INPUT,
+    TOP_K_FINAL,
+    RRF_WEIGHT_DENSE,
+    RRF_WEIGHT_BM25,
+    RERANK_MAX_TOKENS,
+    RERANK_MAX_LENGTH,
+    RERANK_BATCH_SIZE,
+    LANG_DETECT_MIN_CHARS,
+    SAME_LANG_RATIO,
+    CONTEXT_TOP_K,
+    MMR_LAMBDA,
+    MMR_POOL_K,
+    DUP_EMB_COS_THRESHOLD,
+    DUP_CHAR_IOU_THRESHOLD,
+    PER_DOC_CAP,
+    PER_PAGE_CAP,
+    LANG_MIN_COVER,
+    CONTEXT_TOKENS_BUDGET,
+    SNIPPET_MAX_CHARS,
+    REGEN_LANG_RATIO_THRESHOLD,
+    MAX_QUOTE_WORDS,
+    INSUFFICIENT_PREFIX,
+    INSUFFICIENT_ANSWER,
+    INSUFFICIENT_MIN_RERANK_SUM,
+    LLM_DEFAULT_TEMPERATURE,
+    LLM_DEFAULT_MAX_TOKENS,
+    RELAX_DUP_EMB_COS_STEP,
+    RELAX_DUP_EMB_COS_MAX,
+    EMBED_GPU_IDS,
+    RERANK_GPU_IDS,
+    RERANK_GPU_ID,
+    EMBED_BATCH_SIZE,
+)
 
-# FAISS HNSW
-HNSW_M = int(os.getenv("RAG_HNSW_M", "64"))
-HNSW_EF_CONSTRUCTION = int(os.getenv("RAG_HNSW_EF_CONSTRUCTION", "512"))
-HNSW_EF_SEARCH_BASE = int(os.getenv("RAG_HNSW_EF_SEARCH_BASE", "128"))
-HNSW_EF_SEARCH_PER_TOPK_MULT = int(os.getenv("RAG_HNSW_EF_SEARCH_PER_TOPK_MULT", "2"))
-HNSW_USE_DYNAMIC_EF_SEARCH = os.getenv("RAG_HNSW_USE_DYNAMIC_EF_SEARCH", "1") not in {"0", "false", "False"}
-HNSW_EF_SEARCH_MAX = int(os.getenv("RAG_HNSW_EF_SEARCH_MAX", "512"))
-HNSW_FAILSAFE_RATIO = float(os.getenv("RAG_HNSW_FAILSAFE_RATIO", "0.8"))
-HNSW_FAILSAFE_MAX_RETRY = int(os.getenv("RAG_HNSW_FAILSAFE_MAX_RETRY", "1"))
-_cpu_threads_env = os.getenv("RAG_FAISS_CPU_THREADS")
-FAISS_CPU_THREADS = (None if _cpu_threads_env in ("None", "none", "") else (int(_cpu_threads_env) if _cpu_threads_env is not None else mp.cpu_count()))
 try:
     if FAISS_CPU_THREADS is not None:
         import faiss as _faiss  # локальный импорт
         _faiss.omp_set_num_threads(int(FAISS_CPU_THREADS))
 except Exception:
     pass
-
-# Веточный ретривал / RRF / реранк
-TOP_K_DENSE_BRANCH = 100
-TOP_K_BM25_BRANCH = 100
-RRF_K = 60
-TOP_K_RERANK_INPUT = 150
-RRF_WEIGHT_DENSE = 1.0
-RRF_WEIGHT_BM25 = 1.0
-
-# Параметры реранкера
-RERANK_MAX_TOKENS = 380
-RERANK_MAX_LENGTH = 512
-RERANK_BATCH_SIZE = 32
-
-# Детекция языка
-LANG_DETECT_MIN_CHARS = 40
-SAME_LANG_RATIO = 0.8
-
-# Контекст и бюджет
-CONTEXT_TOP_K = int(os.getenv("RAG_CONTEXT_TOP_K", "6"))
-MMR_LAMBDA = float(os.getenv("RAG_MMR_LAMBDA", "0.5"))
-MMR_POOL_K = int(os.getenv("RAG_MMR_POOL_K", "24"))
-DUP_EMB_COS_THRESHOLD = float(os.getenv("RAG_DUP_EMB_COS_THRESHOLD", "0.90"))
-DUP_CHAR_IOU_THRESHOLD = float(os.getenv("RAG_DUP_CHAR_IOU_THRESHOLD", "0.60"))
-PER_DOC_CAP = int(os.getenv("RAG_PER_DOC_CAP", "2"))
-PER_PAGE_CAP = int(os.getenv("RAG_PER_PAGE_CAP", "1"))
-_lang_min_cover_env = os.getenv("RAG_LANG_MIN_COVER", "{\"ru\":1, \"en\":1}")
-try:
-    LANG_MIN_COVER = json.loads(_lang_min_cover_env)
-except Exception:
-    LANG_MIN_COVER = {"ru": 1, "en": 1}
-CONTEXT_TOKENS_BUDGET = int(os.getenv("RAG_CONTEXT_TOKENS_BUDGET", "1200"))
-SNIPPET_MAX_CHARS = int(os.getenv("RAG_SNIPPET_MAX_CHARS", "650"))
-REGEN_LANG_RATIO_THRESHOLD = float(os.getenv("RAG_LANG_RATIO_THRESHOLD", "0.9"))
-MAX_QUOTE_WORDS = int(os.getenv("RAG_MAX_QUOTE_WORDS", "30"))
-INSUFFICIENT_MIN_RERANK_SUM = float(os.getenv("RAG_MIN_RERANK_SUM", "0.0"))
-
-# LLM
-LLM_DEFAULT_TEMPERATURE = float(os.getenv("RAG_LLM_TEMPERATURE", "0.2"))
-LLM_DEFAULT_MAX_TOKENS = int(os.getenv("RAG_LLM_MAX_TOKENS", "550"))
-
-# Ослабление порогов
-RELAX_DUP_EMB_COS_STEP = float(os.getenv("RAG_RELAX_DUP_COS_STEP", "0.02"))
-RELAX_DUP_EMB_COS_MAX = float(os.getenv("RAG_RELAX_DUP_COS_MAX", "0.96"))
-
-# GPU настройки
-def _parse_gpu_ids(val: str) -> list[int]:
-    ids: list[int] = []
-    for part in (val or "").split(","):
-        s = part.strip()
-        if not s:
-            continue
-        try:
-            ids.append(int(s))
-        except ValueError:
-            continue
-    return ids or [0]
-
-EMBED_GPU_IDS: list[int] = _parse_gpu_ids(os.getenv("RAG_GPU_IDS_EMBED", "0,1"))
-RERANK_GPU_IDS: list[int] = _parse_gpu_ids(os.getenv("RAG_GPU_IDS_RERANK", "2"))
-RERANK_GPU_ID: int = RERANK_GPU_IDS[0]
-EMBED_BATCH_SIZE: int = int(os.getenv("RAG_EMBED_BATCH", "64"))
 
 # Рантайм-настройки генерации / перевода (устанавливаются в create_rag_chain)
 runtime_openrouter_api_key: str | None = None

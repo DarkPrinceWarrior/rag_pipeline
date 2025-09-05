@@ -57,7 +57,7 @@ def chunk_text(text: str, chunk_size: int = rc.CHUNK_SIZE, overlap: int = rc.CHU
         separators=["\n\n", "\n", ". ", ", ", " ", ""],
     )
     chunks = splitter.split_text(text)
-    return [c for c in chunks if isinstance(c, str) and len(c.strip()) > 20]
+    return [c for c in chunks if isinstance(c, str) and len(c.strip()) > int(rc.CHUNK_MIN_CHARS)]
 
 
 def build_and_load_knowledge_base(pdf_dir: str, index_dir: str, force_rebuild: bool = False) -> bool:

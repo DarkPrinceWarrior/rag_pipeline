@@ -99,10 +99,10 @@ def initialize_models(load_embedder: bool = True, load_reranker: bool = True) ->
         try:
             import torch  # type: ignore
             has_cuda = bool(getattr(torch.cuda, "is_available", lambda: False)())
-            device = f"cuda:{rc.RERANK_GPU_ID}" if has_cuda else "cuda:0"
+            device = f"cuda:{rc.RERANK_GPU_ID}" if has_cuda else os.getenv("RAG_DEFAULT_CUDA_DEVICE", "cuda:0")
             use_fp16 = has_cuda
         except Exception:
-            device = "cuda:0"
+            device = os.getenv("RAG_DEFAULT_CUDA_DEVICE", "cuda:0")
             use_fp16 = False
         rc.reranker = FlagReranker(
             rc.RERANKER_MODEL_NAME,

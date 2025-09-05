@@ -18,7 +18,7 @@ import requests
 
 import rag_core as rc
 from rag_core import debug_log, format_citation
-from rag_models import initialize_models
+from rag_models import initialize_models, rerank_multi_gpu
 from rag_config import (
     RETRIEVAL_DENSE_RU,
     RETRIEVAL_BM25_RU,
@@ -467,17 +467,21 @@ def hybrid_search_with_rerank(question: str, apply_lang_quota: bool = True) -> D
         }
 
     fused_for_rerank = truncate_candidates_for_rerank(fused_top)
-    pairs = [(question, c.get("text_ref", "") or "") for c in fused_for_rerank]
+    texts = [c.get("text_ref", "") or "" for c in fused_for_rerank]
 
-    if rc.reranker is None:
+    if not rc.reranker_pools and rc.reranker is None:
         initialize_models()
 
-    scores = rc.reranker.compute_score(
-        pairs,
-        batch_size=rc.RERANK_BATCH_SIZE,
-        max_length=rc.RERANK_MAX_LENGTH,
-        normalize=True,
-    )
+    if rc.reranker_pools:
+        scores = rerank_multi_gpu(question, texts, rc.reranker_pools)
+    else:
+        pairs = [(question, t) for t in texts]
+        scores = rc.reranker.compute_score(
+            pairs,
+            batch_size=rc.RERANK_BATCH_SIZE,
+            max_length=rc.RERANK_MAX_LENGTH,
+            normalize=True,
+        )
     reranked = []
     for cand, scr in zip(fused_for_rerank, scores):
         item = cand.copy()

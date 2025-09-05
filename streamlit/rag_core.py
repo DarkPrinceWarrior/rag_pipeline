@@ -2,6 +2,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+import faiss
+
 from rag_config import (
     BASE_DIR,
     PDF_DIR,
@@ -58,6 +60,7 @@ from rag_config import (
     RERANK_GPU_IDS,
     RERANK_GPU_ID,
     EMBED_BATCH_SIZE,
+    FAISS_USE_GPU,
 )
 
 # Рантайм-настройки генерации / перевода (устанавливаются в create_rag_chain)
@@ -73,6 +76,7 @@ runtime_language_enforcement: bool = True
 # ---------------------------
 embedder = None
 reranker = None
+reranker_pools = []
 faiss_index = None
 chunks_metadata: list[dict[str, Any]] = []
 EMB_MATRIX = None
@@ -101,6 +105,21 @@ def debug_log(message: str, *args: Any) -> None:
         logging.getLogger(__name__).debug(message, *args)
     except Exception:
         pass
+
+
+def to_gpu_sharded(index_cpu):
+    """Переносит CPU-индекс FAISS на все доступные GPU в режиме шардирования."""
+    if not FAISS_USE_GPU:
+        return index_cpu
+    try:
+        ngpu = faiss.get_num_gpus()
+        if ngpu <= 0:
+            return index_cpu
+        co = faiss.GpuMultipleClonerOptions()
+        co.shard = True
+        return faiss.index_cpu_to_all_gpus(index_cpu, co)
+    except Exception:
+        return index_cpu
 
 def format_citation(meta: dict[str, Any]) -> str:
     """Формат ссылки на источник из метаданных чанка."""

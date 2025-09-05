@@ -1,16 +1,45 @@
-<!-- cd /root/almaservice/rag_pipeline && \
-export RAG_EMBED_DEVICES="cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6" \
-RAG_RERANK_DEVICE="cuda:7" \
-RAG_EMBED_BATCH=64 \
-RAG_EMBED_MAX_LENGTH_TOKENS=1024 \
-RAG_FAISS_CPU_THREADS="$(nproc)" && \
-python - <<'PY' && \
-streamlit run /root/almaservice/rag_pipeline/streamlit/app.py --server.headless true --server.port 8501
-import sys
-sys.path.append('/root/almaservice/rag_pipeline/streamlit')
-import rag_core as rc
-from rag_ingestion import build_and_load_knowledge_base
-build_and_load_knowledge_base(rc.PDF_DIR, rc.VECTOR_STORE_PATH, force_rebuild=False)
-PY -->
+<!-- # Какие GPU видим
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
-<!-- PYTHONPATH=/root/almaservice/rag_pipeline/streamlit:/root/almaservice/rag_pipeline python3 /root/almaservice/rag_pipeline/scripts/build_kb.py -->
+# Разводим нагрузки: эмбеддинг на 6 GPU, реранк — на 2 GPU
+export RAG_GPU_IDS_EMBED=0,1,2,3,4,5
+export RAG_GPU_IDS_RERANK=6,7
+
+# Модели (современные, быстрые, мультиязычные)
+export RAG_EMBEDDING_MODEL="google/embeddinggemma-300m"   # 1024-d, MRL/квант.-friendly п
+export RAG_RERANK_MODEL="BAAI/bge-reranker-v2-m3"          # быстрый SOTA реранкер v2
+
+# Батчи (стартовые — под A5000 24GB; при длинных текстах можно снизить)
+export RAG_EMBED_BATCH=128
+export RAG_RERANK_BATCH_SIZE=96
+
+# FAISS: оставляем на CPU (HNSW на GPU не работает)
+export RAG_FAISS_USE_GPU=0
+export RAG_FAISS_CPU_THREADS=$(nproc)  # 24
+
+# PyTorch: память и TF32 (ускоряет матмулы на Ampere)
+export PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.8,max_split_size_mb:64,expandable_segments:True"
+export TORCH_SHOW_CPP_STACKTRACES=1
+
+# NCCL для одной машины без InfiniBand
+export NCCL_IB_DISABLE=1   # не пытаться лезть в IB/RoCE
+# P2P NVLink/PCIe оставляем включённым (по умолчанию)
+
+# Токенайзеры: глушим ворнинг про fork/parallelism
+export TOKENIZERS_PARALLELISM=false
+
+# CPU/BLAS: избегаем оверсабскрипшена потоков
+export OMP_NUM_THREADS=24
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
+# Кэши (на быстрый SSD)
+export HF_HOME=/mnt/ssd/hf
+export HF_HUB_CACHE=/mnt/ssd/hf/hub
+export TRANSFORMERS_CACHE=/mnt/ssd/hf/hub
+export HF_DATASETS_CACHE=/mnt/ssd/hf/datasets
+
+# Запуск твоих скриптов
+python scripts/build_kb.py
+streamlit run streamlit/app.py --server.headless true --server.port 8501
+ -->

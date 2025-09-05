@@ -12,6 +12,7 @@ transformers
 torch
 peft
 torchvision
+faiss-gpu-cu12==1.12.0
 pillow
 docling
 langchain-docling
